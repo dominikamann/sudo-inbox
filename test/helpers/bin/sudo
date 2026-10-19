@@ -3,16 +3,35 @@
 # which only this stub reads.
 printf '%s\n' "$*" >>"${SI_TEST_SUDO_CALLS:-/dev/null}"
 
-if [ "${1:-}" = "-k" ] || [ "${1:-}" = "-K" ]; then
+if { [ "${1:-}" = "-k" ] || [ "${1:-}" = "-K" ]; } && [ "$#" -eq 1 ]; then
   exit 0
 fi
+# sudo -k <command>: ignore cached credentials, run the command.
+[ "${1:-}" = "-k" ] && shift
 
+# sudo -n -l: list rules like real sudo does when listing needs no
+# password. SI_TEST_NOPASSWD holds NOPASSWD specs, one per line.
+# SI_TEST_LISTPW_ANY=1 makes "sudo -n -l <cmd>" succeed for every command,
+# as real sudo does with listpw=any once any NOPASSWD rule exists.
 if [ "${1:-}" = "-n" ] && [ "${2:-}" = "-l" ]; then
   shift 2
+  specs="${SI_TEST_NOPASSWD:-}"
   for allowed in ${SI_TEST_PASSWORDLESS:-}; do
-    [ "${1:-}" = "$allowed" ] && exit 0
+    specs="$specs"$'\n'"/usr/bin/$allowed"
   done
-  exit 1
+  if [ "$#" -gt 0 ]; then
+    [ "${SI_TEST_LISTPW_ANY:-}" = 1 ] && exit 0
+    for allowed in ${SI_TEST_PASSWORDLESS:-}; do
+      [ "${1:-}" = "$allowed" ] && exit 0
+    done
+    exit 1
+  fi
+  [ -n "${specs//$'\n'/}" ] || exit 1
+  echo "User tester may run the following commands on test:"
+  while IFS= read -r spec; do
+    [ -n "$spec" ] && echo "    (root) NOPASSWD: $spec"
+  done <<<"$specs"
+  exit 0
 fi
 
 if [ "${SI_TEST_SUDO_FAIL:-}" = "1" ]; then

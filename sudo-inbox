@@ -13,6 +13,10 @@ STATE="${XDG_STATE_HOME:-$HOME/.local/state}/sudo-inbox"
 ENTRIES="$STATE/entries"
 MAX_SCRIPT_BYTES=122880 # below Linux MAX_ARG_STRLEN (128 KiB)
 LONG_SCRIPT_LINES=60
+LONG_LINE=200
+MAX_TITLE=200
+MAX_REASON=2048
+STALE_SECONDS=86400
 RULE_HEAVY="════════════════════════════════════════"
 RULE_LIGHT="────────────────────────────────────────"
 ROOT_LOG="/var/log/sudo-inbox.log"
@@ -89,8 +93,9 @@ For agents:
               Queue a script (stdin or -f).
   add-secret <NAME> --env <path> [options]
               Ask the user to set a secret.
-  wait <n> [--timeout 20m]
+  wait <n> [--timeout 9m]
               Block until entry n is handled.
+              Exit 4: still waiting, call again.
   result <n>  Print status and output of n.
 
 For you:
@@ -103,9 +108,9 @@ For you:
               Set a secret in a .env file.
 
 Setup:
-  hook claude-code
-              Claude Code PreToolUse hook.
-  install-hook claude-code
+  hook claude-code|codex
+              PreToolUse hook for the agent.
+  install-hook claude-code|codex
               Install that hook.
   help, version
 EOF
@@ -118,34 +123,52 @@ log_user() {
   printf '%s %s\n' "$(now_utc)" "$*" >>"$STATE/log"
 }
 
-# Print stdin with control characters in caret notation (ESC -> ^[), and
-# C1 controls and bidi overrides as <U+XXXX>, so nothing can move the
-# cursor or hide text on the terminal. Newline and tab are kept, unless
-# the first argument is "line", which also shows them as ^J and ^I.
-sanitize() {
-  local LC_ALL=C text i ch caret hex
-  IFS= read -r -d '' text || true
+# sanitize_str <text> [line]: sets SANITIZED to <text> with control
+# characters in caret notation (ESC -> ^[), and C1 controls and bidi
+# overrides as <U+XXXX>, so nothing can move the cursor or hide text on
+# the terminal. Newline and tab are kept, unless the second argument is
+# "line", which also shows them as ^J and ^I. Clean text is passed through
+# without work, so long scripts and output stay fast.
+SANITIZED=""
+sanitize_str() {
+  local LC_ALL=C text="$1" i ch caret hex
+  if [ "${2:-}" = line ]; then
+    if [[ "$text" != *[$'\001'-$'\037'$'\177'-$'\377']* ]]; then SANITIZED="$text"; return; fi
+  elif [[ "$text" != *[$'\001'-$'\010'$'\013'-$'\037'$'\177'-$'\377']* ]]; then
+    SANITIZED="$text"
+    return
+  fi
   for ((i = 1; i < 32; i++)); do
-    if [ "${1:-}" != line ] && { [ "$i" -eq 9 ] || [ "$i" -eq 10 ]; }; then continue; fi
+    if [ "${2:-}" != line ] && { [ "$i" -eq 9 ] || [ "$i" -eq 10 ]; }; then continue; fi
     printf -v ch '%b' "\\$(printf '%03o' "$i")"
+    [[ "$text" == *"$ch"* ]] || continue
     printf -v caret '^%b' "\\$(printf '%03o' $((i + 64)))"
     text="${text//"$ch"/"$caret"}"
   done
   text="${text//$'\177'/^?}"
-  for ((i = 0x80; i <= 0x9f; i++)); do
-    printf -v ch '%b' "\\xc2\\x$(printf '%02x' "$i")"
-    printf -v hex '<U+%04X>' "$i"
-    text="${text//"$ch"/"$hex"}"
-  done
-  for hex in aa:202A ab:202B ac:202C ad:202D ae:202E; do
-    printf -v ch '%b' "\\xe2\\x80\\x${hex%%:*}"
-    text="${text//"$ch"/<U+${hex#*:}>}"
-  done
-  for hex in a6:2066 a7:2067 a8:2068 a9:2069; do
-    printf -v ch '%b' "\\xe2\\x81\\x${hex%%:*}"
-    text="${text//"$ch"/<U+${hex#*:}>}"
-  done
-  printf '%s' "$text"
+  if [[ "$text" == *$'\xc2'* ]]; then
+    for ((i = 0x80; i <= 0x9f; i++)); do
+      printf -v ch '%b' "\\xc2\\x$(printf '%02x' "$i")"
+      printf -v hex '<U+%04X>' "$i"
+      text="${text//"$ch"/"$hex"}"
+    done
+  fi
+  if [[ "$text" == *$'\xe2'* ]]; then
+    for hex in 80:aa:202A 80:ab:202B 80:ac:202C 80:ad:202D 80:ae:202E \
+      81:a6:2066 81:a7:2067 81:a8:2068 81:a9:2069; do
+      printf -v ch '%b' "\\xe2\\x${hex:0:2}\\x${hex:3:2}"
+      text="${text//"$ch"/<U+${hex:6}>}"
+    done
+  fi
+  SANITIZED="$text"
+}
+
+# sanitize [line]: the same as a filter from stdin to stdout.
+sanitize() {
+  local text
+  IFS= read -r -d '' text || true
+  sanitize_str "$text" "${1:-}"
+  printf '%s' "$SANITIZED"
 }
 
 # One field from disk, safe to print on a single line.
@@ -203,7 +226,7 @@ new_entry() {
 # ---------------------------------------------------------------------------
 
 risk_lines() {
-  local line n=0 i
+  local LC_ALL=C line n=0 i
   while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
     for i in "${!RISK_PATTERNS[@]}"; do
@@ -211,6 +234,12 @@ risk_lines() {
         printf '%s: %s\n' "$n" "${RISK_LABELS[$i]}"
       fi
     done
+    if [[ "$line" == *[$'\200'-$'\377']* ]]; then
+      printf '%s: %s\n' "$n" "non-ASCII characters (check for look-alikes)"
+    fi
+    if [ "${#line}" -gt "$LONG_LINE" ]; then
+      printf '%s: %s\n' "$n" "very long line (${#line} characters)"
+    fi
   done
 }
 
@@ -232,6 +261,13 @@ render_header() {
   local reason
   reason="$(field "$n" reason)"
   printf 'Reason (from agent): %s\n' "${reason:--}"
+  local created ts
+  created="$(entry_get "$n" created)"
+  if [[ "$created" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$ ]] \
+    && ts="$(date -u -d "$created" +%s 2>/dev/null)" \
+    && [ $(($(date +%s) - ts)) -gt "$STALE_SECONDS" ]; then
+    echo "! queued more than 24 hours ago: still wanted?"
+  fi
 }
 
 # render_entry <n> [<content>]: full display of an entry. With <content>,
@@ -261,7 +297,8 @@ render_entry() {
   printf '%s\n' "$RULE_LIGHT"
   while IFS= read -r line || [ -n "$line" ]; do
     i=$((i + 1))
-    printf '%3d│%s\n' "$i" "$(printf '%s' "$line" | sanitize)"
+    sanitize_str "$line"
+    printf '%3d│%s\n' "$i" "$SANITIZED"
   done < <(printf '%s' "$content")
   printf '%s\n' "$RULE_HEAVY"
 }
@@ -297,6 +334,8 @@ cmd_add() {
     esac
   done
   [ -n "$title" ] || die 2 "add needs a title"
+  [ "${#title}" -le "$MAX_TITLE" ] || die 2 "title too long (max $MAX_TITLE characters)"
+  [ "${#reason}" -le "$MAX_REASON" ] || die 2 "reason too long (max $MAX_REASON characters)"
 
   mkdir -p "$STATE"
   local tmp size
@@ -335,8 +374,11 @@ cmd_list() {
       others=$((others + 1))
       [ "$others" -le 10 ] || continue
     fi
-    title="$(field "$n" title)"
-    printf '#%s  %s  %s\n' "$n" "$(printf '%s' "$status" | sanitize line)" "${title:0:40}"
+    title="$(entry_get "$n" title)"
+    sanitize_str "${title:0:40}" line
+    title="$SANITIZED"
+    sanitize_str "$status" line
+    printf '#%s  %s  %s\n' "$n" "$SANITIZED" "$title"
     shown=1
   done < <(entry_numbers)
   [ "$shown" -eq 1 ] || echo "Inbox is empty."
@@ -379,7 +421,8 @@ show_live() {
   local line
   while IFS= read -r line || [ -n "$line" ]; do
     [ "$line" = "$SENTINEL" ] && continue
-    printf '%s\n' "$(printf '%s' "$line" | sanitize)"
+    sanitize_str "$line"
+    printf '%s\n' "$SANITIZED"
   done
 }
 
@@ -396,7 +439,7 @@ root_exec() {
   RUN_TMP="$(mktemp "$STATE/.run.XXXXXX")"
   sudo -k 2>/dev/null || true
   set +e
-  sudo -- bash -c "$ROOT_WRAPPER" sudo-inbox "$ROOT_LOG" "$(id -un)" "$n" "$type" "$sha" \
+  sudo -k -- bash -c "$ROOT_WRAPPER" sudo-inbox "$ROOT_LOG" "$(id -un)" "$n" "$type" "$sha" \
     "$(printf '%s' "$title" | sanitize line)" "$payload" "$cwd" 2>&1 \
     | tee "$RUN_TMP" | show_live
   rc="${PIPESTATUS[0]}"
@@ -461,9 +504,9 @@ Check the system, then reject it or queue it again."
     return 0
   fi
 
-  entry_set "$n" status running
   RUN_ENTRY="$n"
   trap on_interrupt HUP INT TERM
+  entry_set "$n" status running
   root_exec "$n" script "$sha" "$title" "$content" "${cwd:-/}" || rc=$?
   trap - HUP INT TERM
   if [ "$ROOT_STARTED" -eq 0 ]; then
@@ -485,7 +528,7 @@ cmd_reject() {
   require_entry "$1"
   local status
   status="$(entry_get "$1" status)"
-  [ "$status" = pending ] || die 5 "entry #$1 is $status"
+  [ "$status" = pending ] || die 5 "entry #$1 is $(printf '%s' "$status" | sanitize line)"
   entry_set "$1" reject_reason "${2:-}"
   entry_set "$1" finished "$(now_utc)"
   entry_set "$1" status rejected
@@ -514,7 +557,11 @@ print_result() {
   esac
   code="$(entry_get "$n" exit_code)"
   printf 'status: %s\nexit_code: %s\n--- output ---\n' "$status" "$code"
-  entry_get "$n" output
+  local out
+  out="$(entry_get "$n" output; echo x)"
+  out="${out%x}"
+  printf '%s' "$out"
+  [ -z "$out" ] || [ "${out: -1}" = $'\n' ] || echo
   [ "$code" = 0 ] && return 0
   return 1
 }
@@ -537,11 +584,11 @@ parse_duration() {
 }
 
 cmd_wait() {
-  local n="" timeout="20m" secs deadline
+  local n="" timeout="9m" secs deadline
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --timeout) [ "$#" -ge 2 ] || die 2 "--timeout needs a value"; timeout="$2"; shift 2 ;;
-      *) [ -z "$n" ] || die 2 "usage: sudo-inbox wait <n> [--timeout 20m]"; n="$1"; shift ;;
+      *) [ -z "$n" ] || die 2 "usage: sudo-inbox wait <n> [--timeout 9m]"; n="$1"; shift ;;
     esac
   done
   require_entry "$n"
@@ -689,7 +736,8 @@ cannot protect the file. Use a root-owned directory."
     die 5 "refused: a parent of $dir is writable by you,
 so root cannot write there safely"
   else
-    payload="$(printf 'set -- %q %q %q %q %q %q\n' "$path" "$name" "$mode" "$owner" "$me" \
+    # A new file in a root-owned directory belongs to root unless --owner says otherwise.
+    payload="$(printf 'set -- %q %q %q %q %q %q\n' "$path" "$name" "$mode" "$owner" "root:root" \
       "$(realpath -e -- "$dir")")$ENV_WRITER"
     root_exec - secret - "Set $name in $path" "$payload" / < <(env_quote "$v1"; echo) || rc=$?
     [ "$ROOT_STARTED" -eq 1 ] || die 6 "sudo authentication failed. Nothing was written."
@@ -775,7 +823,8 @@ Do not run sudo, su, doas or pkexec directly.
 1. Put the commands in a small script with one purpose.
 2. Queue it: sudo-inbox add "<title>" --reason "<why>" < script.sh
 3. Ask the user to run this in their own terminal: sudo-inbox run <n>
-4. Then read the result: sudo-inbox wait <n>
+4. Then wait: sudo-inbox wait <n> --timeout 9m
+   (exit 4 = still waiting: run the same wait again)
 For passwords use: sudo-inbox add-secret <NAME> --env <path>'
 
 # json_get_string <key>: first string value of "<key>" in the JSON on stdin.
@@ -812,11 +861,45 @@ json_get_string() {
   return 1
 }
 
+# nopasswd_allows <cmd> [args...]: 0 if a NOPASSWD rule covers the
+# command. "sudo -n -l <cmd>" is not enough: with sudo's default
+# listpw=any it succeeds for every allowed command as soon as any
+# NOPASSWD rule exists, even if that command needs a password.
+NOPASSWD_SPECS=""
+NOPASSWD_LOADED=0
+nopasswd_allows() {
+  local cmd="${1:-}" spec sp sa args
+  shift || true
+  args="$*"
+  if [ "$NOPASSWD_LOADED" -eq 0 ]; then
+    NOPASSWD_SPECS="$(sudo -n -l 2>/dev/null | sed -n 's/.*NOPASSWD: *//p' \
+      | tr ',' '\n' | sed 's/^ *//; s/ *$//')" || true
+    NOPASSWD_LOADED=1
+  fi
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    [ "$spec" = ALL ] && return 0
+    sp="${spec%% *}"
+    sa=""
+    [ "$sp" = "$spec" ] || sa="${spec#* }"
+    if [ "${sp##*/}" = "${cmd##*/}" ]; then
+      [ -z "$sa" ] && return 0
+      # shellcheck disable=SC2053 # sudoers argument patterns are globs
+      [[ "$args" == $sa ]] && return 0
+    fi
+  done <<<"$NOPASSWD_SPECS"
+  return 1
+}
+
 # hook_check <command>: 0 if allowed, 1 if it runs a privileged command
 # that would need a password.
 hook_check() {
   local cmd="$1" seg sep i w base
   local -a words
+  local re_dq='"([^"\\]|\\.)*"' re_sq="'[^']*'"
+  # Quoted text is data, not a command: blank it out before splitting.
+  while [[ "$cmd" =~ $re_dq ]]; do cmd="${cmd/"${BASH_REMATCH[0]}"/Q}"; done
+  while [[ "$cmd" =~ $re_sq ]]; do cmd="${cmd/"${BASH_REMATCH[0]}"/Q}"; done
   # shellcheck disable=SC2016 # literal separators
   for sep in '$(' '&&' '||' ';' '|' '&' '(' ')' '`'; do
     cmd="${cmd//"$sep"/$'\n'}"
@@ -849,7 +932,8 @@ hook_check() {
         case "${words[$((i + 1))]:-}" in
           -n | -l | -k | -K) continue ;;
         esac
-        sudo -n -l "${words[@]:$((i + 1))}" >/dev/null 2>&1 || return 1
+        [[ "${words[$((i + 1))]:-}" != -* ]] || return 1
+        nopasswd_allows "${words[@]:$((i + 1))}" || return 1
         ;;
     esac
   done <<<"$cmd"
@@ -857,7 +941,10 @@ hook_check() {
 }
 
 cmd_hook() {
-  [ "${1:-}" = claude-code ] || die 2 "usage: sudo-inbox hook claude-code"
+  case "${1:-}" in
+    claude-code | codex) ;;
+    *) die 2 "usage: sudo-inbox hook claude-code|codex" ;;
+  esac
   local input tool command
   IFS= read -r -d '' input || true
   tool="$(json_get_string tool_name <<<"$input")" || return 0
@@ -870,17 +957,25 @@ cmd_hook() {
 }
 
 cmd_install_hook() {
-  [ "${1:-}" = claude-code ] || die 2 "usage: sudo-inbox install-hook claude-code"
-  local self settings snippet
+  local agent="${1:-}" self settings matcher snippet trust=""
+  case "$agent" in
+    claude-code) settings="$HOME/.claude/settings.json" matcher="Bash" ;;
+    codex)
+      settings="$HOME/.codex/hooks.json" matcher="^Bash\$"
+      trust="In Codex, run /hooks once to review and trust it."
+      ;;
+    *) die 2 "usage: sudo-inbox install-hook claude-code|codex" ;;
+  esac
   self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-  settings="$HOME/.claude/settings.json"
+  self="${self//\\/\\\\}"
+  self="${self//\"/\\\"}"
   snippet="{
   \"hooks\": {
     \"PreToolUse\": [
       {
-        \"matcher\": \"Bash\",
+        \"matcher\": \"$matcher\",
         \"hooks\": [
-          { \"type\": \"command\", \"command\": \"$self hook claude-code\" }
+          { \"type\": \"command\", \"command\": \"$self hook $agent\" }
         ]
       }
     ]
@@ -890,14 +985,17 @@ cmd_install_hook() {
     mkdir -p "$(dirname "$settings")"
     printf '%s\n' "$snippet" >"$settings"
     echo "Hook installed in $settings."
+    [ -z "$trust" ] || echo "$trust"
     return 0
   fi
-  if grep -q 'sudo-inbox hook claude-code' "$settings"; then
+  if grep -q "sudo-inbox hook $agent" "$settings"; then
     echo "Hook already installed."
     return 0
   fi
+  echo "$settings already exists, so it was not changed."
+  echo "Next step: add this entry under \"hooks\" → \"PreToolUse\":"
   printf '%s\n' "$snippet"
-  echo "Add this to \"hooks\" → \"PreToolUse\" in $settings."
+  [ -z "$trust" ] || echo "$trust"
   exit 5
 }
 

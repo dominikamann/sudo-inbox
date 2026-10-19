@@ -55,3 +55,15 @@ load helpers/common
   run "$SI" wait 1 --timeout soon
   [ "$status" -eq 2 ]
 }
+
+@test "help and agent text recommend a timeout that fits agent tools" {
+  run "$SI" help
+  [[ "$output" == *"--timeout 9m"* ]]
+}
+
+@test "result always ends with a newline" {
+  echo 'printf nonl' | "$SI" add T
+  echo y | "$SI" run 1 >/dev/null
+  "$SI" result 1 >"$BATS_TEST_TMPDIR/r"
+  [ "$(tail -c 1 "$BATS_TEST_TMPDIR/r" | od -An -c | tr -d ' ')" = '\n' ]
+}

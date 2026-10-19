@@ -141,3 +141,38 @@ EOS
   [ "$status" -eq 1 ]
   [[ "$output" == *"status: interrupted"* ]]
 }
+
+@test "root call never creates a cached sudo login" {
+  echo true | "$SI" add T
+  echo y | "$SI" run 1 >/dev/null
+  grep -q -- '^-k -- bash -c' "$SI_TEST_SUDO_CALLS"
+}
+
+@test "review shows the age and warns about old entries" {
+  echo true | "$SI" add T
+  printf '2026-01-01T00:00:00Z' >"$ENTRIES/1/created"
+  run "$SI" show 1
+  [[ "$output" == *"! queued more than 24 hours ago"* ]]
+}
+
+@test "long script renders quickly" {
+  seq 3000 | sed 's/^/echo line /' | "$SI" add T
+  start=$(date +%s)
+  "$SI" show 1 >/dev/null
+  [ $(( $(date +%s) - start )) -lt 5 ]
+}
+
+@test "long output is shown quickly" {
+  echo 'seq 5000' | "$SI" add T
+  start=$(date +%s)
+  echo y | "$SI" run 1 >/dev/null
+  [ $(( $(date +%s) - start )) -lt 5 ]
+}
+
+@test "reject on a non-pending entry prints status safely" {
+  echo true | "$SI" add T
+  printf 'done\033[2J' >"$ENTRIES/1/status"
+  run "$SI" reject 1
+  [ "$status" -eq 5 ]
+  [[ "$output" != *$'\033'* ]]
+}

@@ -153,3 +153,29 @@ load helpers/common
   [ "$status" -eq 5 ]
   [[ "$output" == *"max 120 KiB"* ]]
 }
+
+@test "invisible and non-ASCII characters are flagged" {
+  printf 'echo a\xe2\x80\x8bb\n' | "$SI" add T
+  run "$SI" show 1
+  [[ "$output" == *"! line 1: non-ASCII characters"* ]]
+}
+
+@test "very long lines are flagged" {
+  printf 'echo %0250d\n' 0 | "$SI" add T
+  run "$SI" show 1
+  [[ "$output" == *"! line 1: very long line"* ]]
+}
+
+@test "title and reason are capped" {
+  long="$(printf '%0201d' 0)"
+  run bash -c "echo true | '$SI' add '$long'"
+  [ "$status" -eq 2 ]
+  run bash -c "echo true | '$SI' add T --reason \"\$(printf '%02049d' 0)\""
+  [ "$status" -eq 2 ]
+}
+
+@test "list truncates before sanitizing" {
+  echo true | "$SI" add "$(printf 'x%.0s' $(seq 38))$(printf '\xc2\x9b')yz"
+  run "$SI" list
+  [[ "$output" == *'<U+009B>'* ]]
+}
