@@ -294,7 +294,11 @@ cmd_list() {
 cmd_show() {
   [ "$#" -eq 1 ] || die 2 "usage: sudo-inbox show <n>"
   require_entry "$1"
-  render_entry "$1"
+  if [ "$(entry_get "$1" type)" = secret ]; then
+    render_secret "$1"
+  else
+    render_entry "$1"
+  fi
 }
 
 oldest_pending() {
@@ -326,7 +330,8 @@ ROOT_OUTPUT=""
 ROOT_STARTED=0
 root_exec() {
   local n="$1" type="$2" sha="$3" title="$4" payload="$5" tmp raw rc
-  tmp="$(mktemp "$(entry_dir "$n")/.run.XXXXXX")"
+  mkdir -p "$STATE"
+  tmp="$(mktemp "$STATE/.run.XXXXXX")"
   sudo -k 2>/dev/null || true
   set +e
   sudo -- bash -c "$ROOT_WRAPPER" sudo-inbox "$ROOT_LOG" "$(id -un)" "$n" "$type" "$sha" \
@@ -360,6 +365,10 @@ cmd_run() {
   require_entry "$n"
   status="$(entry_get "$n" status)"
   [ "$status" = pending ] || die 5 "entry #$n is $status"
+  if [ "$(entry_get "$n" type)" = secret ]; then
+    run_secret "$n"
+    return 0
+  fi
 
   IFS= read -r -d '' content <"$(entry_dir "$n")/script" || true
   sha="$(sha256_of "$content")"
@@ -457,6 +466,154 @@ cmd_wait() {
 }
 
 # ---------------------------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------------------------
+
+# Runs as the user or as root with the arguments set in front of it.
+# Reads the already quoted value from stdin, never from argv.
+# shellcheck disable=SC2016 # expanded by the writer shell, not here
+ENV_WRITER='
+f="$1" key="$2" mode="$3" owner="$4"
+IFS= read -r val
+tmp="$(mktemp "$(dirname "$f")/.sudo-inbox-env.XXXXXX")"
+if [ -f "$f" ]; then grep -v -e "^$key=" "$f" >"$tmp" || true; fi
+printf "%s=%s\n" "$key" "$val" >>"$tmp"
+chmod "$mode" "$tmp"
+chown "$owner" "$tmp"
+mv -f "$tmp" "$f"
+'
+
+S_NAME="" S_ENV="" S_MIN=1 S_MAX=4096 S_OWNER="" S_MODE=600
+parse_secret_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --env | --min | --max | --owner | --mode)
+        [ "$#" -ge 2 ] || die 2 "$1 needs a value"
+        case "$1" in
+          --env) S_ENV="$2" ;;
+          --min) S_MIN="$2" ;;
+          --max) S_MAX="$2" ;;
+          --owner) S_OWNER="$2" ;;
+          --mode) S_MODE="$2" ;;
+        esac
+        shift 2
+        ;;
+      -*) die 2 "unknown option: $1" ;;
+      *) [ -z "$S_NAME" ] || die 2 "only one NAME allowed"; S_NAME="$1"; shift ;;
+    esac
+  done
+  [[ "$S_NAME" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die 2 "NAME must look like MY_SECRET"
+  [ -n "$S_ENV" ] || die 2 "--env <path> is required"
+  [[ "$S_MIN" =~ ^[0-9]+$ && "$S_MAX" =~ ^[0-9]+$ ]] || die 2 "--min/--max need numbers"
+  [[ "$S_MODE" =~ ^[0-7]{3,4}$ ]] || die 2 "--mode needs an octal mode like 600"
+  [[ "$S_ENV" == /* ]] || S_ENV="$PWD/$S_ENV"
+}
+
+check_env_path() {
+  local p="$1" base="${1##*/}"
+  [[ "$base" == .env || "$base" == .env.* || "$base" == *.env ]] \
+    || die 5 "refused: only .env files are allowed ($p)"
+  [ ! -L "$p" ] || die 5 "refused: $p is a symlink"
+  [ ! -e "$p" ] || [ -f "$p" ] || die 5 "refused: $p is not a regular file"
+  [ -d "$(dirname "$p")" ] || die 5 "refused: directory of $p does not exist"
+}
+
+env_quote() {
+  if [[ "$1" =~ ^[A-Za-z0-9_./:@%+=,-]*$ ]]; then
+    printf '%s' "$1"
+  else
+    printf "'%s'" "$1"
+  fi
+}
+
+default_owner() {
+  if [ -e "$1" ]; then stat -c '%U:%G' "$1"; else printf '%s:%s' "$(id -un)" "$(id -gn)"; fi
+}
+
+# Ask for the value, validate it and write it. Sets SECRET_LEN.
+SECRET_LEN=0
+write_secret() {
+  local name="$1" path="$2" min="$3" max="$4" owner="$5" mode="$6" v1="" v2="" payload rc=0
+  printf 'Value for %s: ' "$name" >&2
+  IFS= read -rs v1 || true
+  printf '\nRepeat: ' >&2
+  IFS= read -rs v2 || true
+  printf '\n' >&2
+  [ "$v1" = "$v2" ] || die 5 "Values do not match."
+  if [ "${#v1}" -lt "$min" ] || [ "${#v1}" -gt "$max" ]; then
+    die 5 "length ${#v1} is outside $min..$max"
+  fi
+  [[ "$v1" != *"'"* ]] || die 5 "refused: single quotes are not supported"
+  [ -n "$owner" ] || owner="$(default_owner "$path")"
+  payload="$(printf 'set -e; set -- %q %q %q %q\n' "$path" "$name" "$mode" "$owner")$ENV_WRITER"
+  local dir
+  dir="$(dirname "$path")"
+  if [ -w "$dir" ] && { [ ! -e "$path" ] || [ -w "$path" ]; }; then
+    bash -c "$payload" sudo-inbox-secret < <(env_quote "$v1"; echo) || rc=$?
+  else
+    root_exec - secret - "Set $name in $path" "$payload" < <(env_quote "$v1"; echo) || rc=$?
+    [ "$ROOT_STARTED" -eq 1 ] || die 6 "sudo authentication failed. Nothing was written."
+  fi
+  [ "$rc" -eq 0 ] || die 1 "could not write $path"
+  SECRET_LEN="${#v1}"
+}
+
+cmd_secret() {
+  parse_secret_args "$@"
+  check_env_path "$S_ENV"
+  write_secret "$S_NAME" "$S_ENV" "$S_MIN" "$S_MAX" "$S_OWNER" "$S_MODE"
+  log_user "secret $S_NAME set in $S_ENV"
+  echo "$S_NAME set in $S_ENV (length $SECRET_LEN)."
+}
+
+cmd_add_secret() {
+  parse_secret_args "$@"
+  check_env_path "$S_ENV"
+  local n
+  n="$(new_entry secret)"
+  entry_set "$n" title "Set $S_NAME in $S_ENV"
+  entry_set "$n" reason ""
+  entry_set "$n" name "$S_NAME"
+  entry_set "$n" env "$S_ENV"
+  entry_set "$n" min "$S_MIN"
+  entry_set "$n" max "$S_MAX"
+  entry_set "$n" owner "$S_OWNER"
+  entry_set "$n" mode "$S_MODE"
+  log_user "added #$n secret $S_NAME"
+  echo "Entry #$n is waiting. Ask the user to run: sudo-inbox run $n"
+}
+
+render_secret() {
+  local n="$1" owner
+  owner="$(entry_get "$n" owner)"
+  render_header "$n"
+  printf '%s\n' "$RULE_LIGHT"
+  printf 'Set secret %s\n' "$(entry_get "$n" name)"
+  printf 'File: %s\n' "$(entry_get "$n" env | sanitize)"
+  printf 'Mode: %s  Owner: %s\n' "$(entry_get "$n" mode)" "${owner:-file owner or you}"
+  printf '%s\n' "$RULE_HEAVY"
+}
+
+run_secret() {
+  local n="$1" path
+  path="$(entry_get "$n" env)"
+  render_secret "$n"
+  if ! confirm; then
+    echo "Not run. Entry #$n stays pending."
+    return 0
+  fi
+  check_env_path "$path"
+  write_secret "$(entry_get "$n" name)" "$path" "$(entry_get "$n" min)" \
+    "$(entry_get "$n" max)" "$(entry_get "$n" owner)" "$(entry_get "$n" mode)"
+  entry_set "$n" output "set, length $SECRET_LEN"
+  entry_set "$n" exit_code 0
+  entry_set "$n" finished "$(now_utc)"
+  entry_set "$n" status "done"
+  log_user "ran #$n secret"
+  echo "Done. The agent sees only: set, length $SECRET_LEN"
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -477,6 +634,8 @@ main() {
     reject) cmd_reject "$@" ;;
     result) cmd_result "$@" ;;
     wait) cmd_wait "$@" ;;
+    secret) cmd_secret "$@" ;;
+    add-secret) cmd_add_secret "$@" ;;
     *) die 2 "unknown command: $cmd (see: sudo-inbox help)" ;;
   esac
 }
