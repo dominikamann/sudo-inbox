@@ -17,7 +17,7 @@ jobs:
           VER=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' sudo-inbox)
           test "$TAG" = "$VER" || { echo "tag $TAG, script $VER"; exit 1; }
       - name: Install bats and shellcheck
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq bats shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bats shellcheck && sudo mkdir -p /srv/root-env
       - run: shellcheck sudo-inbox test/helpers/bin/sudo
       - run: bats test
       - run: sha256sum sudo-inbox > sudo-inbox.sha256

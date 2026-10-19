@@ -100,3 +100,44 @@ EOS
   run "$SI" reject 1
   [ "$status" -eq 5 ]
 }
+
+@test "root output is sanitized on screen but kept raw for the agent" {
+  printf 'printf "\\033[2Jfake\\n"\n' | "$SI" add T
+  run bash -c "echo y | '$SI' run 1"
+  [[ "$output" != *$'\033'* ]]
+  [[ "$output" == *'^[[2Jfake'* ]]
+  grep -q $'\033' "$ENTRIES/1/output"
+}
+
+@test "script runs in the directory it was queued from" {
+  mkdir -p "$BATS_TEST_TMPDIR/proj"
+  (cd "$BATS_TEST_TMPDIR/proj" && echo pwd | "$SI" add T)
+  cd "$BATS_TEST_TMPDIR"
+  echo y | "$SI" run 1 >/dev/null
+  [ "$(cat "$ENTRIES/1/output")" = "$BATS_TEST_TMPDIR/proj" ]
+}
+
+@test "root log line stays one line for a title with newlines" {
+  echo true | "$SI" add $'T\n2026-01-01T00:00:00Z user=root entry=99 fake'
+  echo y | "$SI" run 1 >/dev/null
+  [ "$(wc -l <"$SI_TEST_ROOT_LOG")" -eq 1 ]
+}
+
+@test "hangup during run marks entry interrupted" {
+  echo 'sleep 30' | "$SI" add T
+  setsid bash -c "echo y | '$SI' run 1 >/dev/null 2>&1" &
+  pid=$!
+  for _ in $(seq 50); do [ "$(cat "$ENTRIES/1/status")" = running ] && break; sleep 0.1; done
+  [ "$(cat "$ENTRIES/1/status")" = running ]
+  kill -HUP -- "-$pid"
+  for _ in $(seq 50); do [ "$(cat "$ENTRIES/1/status")" = interrupted ] && break; sleep 0.1; done
+  [ "$(cat "$ENTRIES/1/status")" = interrupted ]
+  [ "$(tail -1 "$SI_TEST_SUDO_CALLS")" = "-k" ]
+  [ -z "$(ls -A "$XDG_STATE_HOME/sudo-inbox" | grep '^\.run\.' || true)" ]
+  run bash -c "echo y | '$SI' run 1"
+  [ "$status" -eq 5 ]
+  [[ "$output" == *"interrupted"* ]]
+  run "$SI" result 1
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"status: interrupted"* ]]
+}

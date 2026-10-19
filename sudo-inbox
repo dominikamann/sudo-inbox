@@ -11,7 +11,7 @@ fi
 VERSION="0.1.0"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/sudo-inbox"
 ENTRIES="$STATE/entries"
-MAX_SCRIPT_BYTES=262144
+MAX_SCRIPT_BYTES=122880 # below Linux MAX_ARG_STRLEN (128 KiB)
 LONG_SCRIPT_LINES=60
 RULE_HEAVY="════════════════════════════════════════"
 RULE_LIGHT="────────────────────────────────────────"
@@ -19,15 +19,25 @@ ROOT_LOG="/var/log/sudo-inbox.log"
 SENTINEL="__SUDO_INBOX_STARTED__"
 
 # Runs as root through one sudo call. Arguments:
-# $1 log path, $2 user, $3 entry, $4 type, $5 sha256, $6 title, $7 payload.
+# $1 log path, $2 user, $3 entry, $4 type, $5 sha256, $6 title,
+# $7 payload, $8 working directory.
 # The sentinel proves that sudo got past authentication.
 # shellcheck disable=SC2016 # expanded by the root shell, not here
 ROOT_WRAPPER='
+log() {
+  printf "%s user=%s entry=%s type=%s sha256=%s exit=%s title=%s\n" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$3" "$4" "$5" "$6" "$1" "$7" >>"$LOG"
+}
+LOG="$1"
+trap '"'"'log interrupted "$@"; exit 130'"'"' HUP INT TERM
 echo "'"$SENTINEL"'"
+if ! cd -- "$8"; then
+  log 1 "$@"
+  exit 1
+fi
 bash -c "$7" "sudo-inbox-$3"
 rc=$?
-printf "%s user=%s entry=%s type=%s sha256=%s exit=%s title=%s\n" \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$3" "$4" "$5" "$rc" "$6" >>"$1"
+log "$rc" "$@"
 exit "$rc"
 '
 
@@ -42,6 +52,8 @@ RISK_PATTERNS=(
   'sshd_config|authorized_keys'
   'systemctl[[:space:]]+(start|stop|restart|enable|disable|mask)'
   'mkfs|dd[[:space:]]+if=|>[[:space:]]*/dev/sd'
+  "(^|[[:space:]=<>\"'])(\\./|\\.\\./|~/|\\\$HOME|\\\$\\{HOME\\})"
+  $'\xe2\x80\xaa|\xe2\x80\xab|\xe2\x80\xac|\xe2\x80\xad|\xe2\x80\xae|\xe2\x81\xa6|\xe2\x81\xa7|\xe2\x81\xa8|\xe2\x81\xa9'
 )
 RISK_LABELS=(
   'recursive force delete'
@@ -53,6 +65,8 @@ RISK_LABELS=(
   'SSH access'
   'changes a service'
   'writes to a disk'
+  'uses a file the agent can change'
+  'hidden text direction (bidi)'
 )
 
 # ---------------------------------------------------------------------------
@@ -104,20 +118,38 @@ log_user() {
   printf '%s %s\n' "$(now_utc)" "$*" >>"$STATE/log"
 }
 
-# Print stdin with control characters (except newline and tab) in caret
-# notation, so nothing can move the cursor or hide text on the terminal.
+# Print stdin with control characters in caret notation (ESC -> ^[), and
+# C1 controls and bidi overrides as <U+XXXX>, so nothing can move the
+# cursor or hide text on the terminal. Newline and tab are kept, unless
+# the first argument is "line", which also shows them as ^J and ^I.
 sanitize() {
-  local LC_ALL=C text i ch caret
+  local LC_ALL=C text i ch caret hex
   IFS= read -r -d '' text || true
   for ((i = 1; i < 32; i++)); do
-    [ "$i" -eq 9 ] || [ "$i" -eq 10 ] && continue
+    if [ "${1:-}" != line ] && { [ "$i" -eq 9 ] || [ "$i" -eq 10 ]; }; then continue; fi
     printf -v ch '%b' "\\$(printf '%03o' "$i")"
     printf -v caret '^%b' "\\$(printf '%03o' $((i + 64)))"
     text="${text//"$ch"/"$caret"}"
   done
   text="${text//$'\177'/^?}"
+  for ((i = 0x80; i <= 0x9f; i++)); do
+    printf -v ch '%b' "\\xc2\\x$(printf '%02x' "$i")"
+    printf -v hex '<U+%04X>' "$i"
+    text="${text//"$ch"/"$hex"}"
+  done
+  for hex in aa:202A ab:202B ac:202C ad:202D ae:202E; do
+    printf -v ch '%b' "\\xe2\\x80\\x${hex%%:*}"
+    text="${text//"$ch"/<U+${hex#*:}>}"
+  done
+  for hex in a6:2066 a7:2067 a8:2068 a9:2069; do
+    printf -v ch '%b' "\\xe2\\x81\\x${hex%%:*}"
+    text="${text//"$ch"/<U+${hex#*:}>}"
+  done
   printf '%s' "$text"
 }
+
+# One field from disk, safe to print on a single line.
+field() { entry_get "$1" "$2" | sanitize line; }
 
 # ---------------------------------------------------------------------------
 # Storage
@@ -194,11 +226,11 @@ sha256_of() { printf '%s' "$1" | sha256sum | cut -d ' ' -f 1; }
 render_header() {
   local n="$1"
   printf '%s\n' "$RULE_HEAVY"
-  printf '#%s  %s  %s  %s\n' "$n" "$(entry_get "$n" status)" \
-    "$(entry_get "$n" type)" "$(entry_get "$n" created)"
-  printf 'Title (from agent): %s\n' "$(entry_get "$n" title | sanitize)"
+  printf '#%s  %s  %s  %s\n' "$n" "$(field "$n" status)" \
+    "$(field "$n" type)" "$(field "$n" created)"
+  printf 'Title (from agent): %s\n' "$(field "$n" title)"
   local reason
-  reason="$(entry_get "$n" reason | sanitize)"
+  reason="$(field "$n" reason)"
   printf 'Reason (from agent): %s\n' "${reason:--}"
 }
 
@@ -212,6 +244,7 @@ render_entry() {
     IFS= read -r -d '' content <"$(entry_dir "$n")/script" || true
   fi
   render_header "$n"
+  printf 'Runs in: %s\n' "$(field "$n" cwd)"
   printf '%s\n' "$RULE_LIGHT"
   lines="$(count_lines "$content")"
   echo "Checks by sudo-inbox:"
@@ -276,7 +309,7 @@ cmd_add() {
   fi
   size="$(wc -c <"$tmp")"
   if [ "$size" -eq 0 ]; then rm -f "$tmp"; die 5 "script is empty"; fi
-  if [ "$size" -gt "$MAX_SCRIPT_BYTES" ]; then rm -f "$tmp"; die 5 "script too large (max 256 KiB)"; fi
+  if [ "$size" -gt "$MAX_SCRIPT_BYTES" ]; then rm -f "$tmp"; die 5 "script too large (max 120 KiB)"; fi
   if [ "$(tr -d '\000' <"$tmp" | wc -c)" -ne "$size" ]; then
     rm -f "$tmp"
     die 5 "script contains NUL bytes"
@@ -287,6 +320,7 @@ cmd_add() {
   mv "$tmp" "$(entry_dir "$n")/script"
   entry_set "$n" title "$title"
   entry_set "$n" reason "$reason"
+  entry_set "$n" cwd "$PWD"
   log_user "added #$n $title"
   notify "$n" "$title"
   echo "Entry #$n is waiting. Ask the user to run: sudo-inbox run $n"
@@ -301,8 +335,8 @@ cmd_list() {
       others=$((others + 1))
       [ "$others" -le 10 ] || continue
     fi
-    title="$(entry_get "$n" title | sanitize)"
-    printf '#%s  %s  %s\n' "$n" "$status" "${title:0:40}"
+    title="$(field "$n" title)"
+    printf '#%s  %s  %s\n' "$n" "$(printf '%s' "$status" | sanitize line)" "${title:0:40}"
     shown=1
   done < <(entry_numbers)
   [ "$shown" -eq 1 ] || echo "Inbox is empty."
@@ -339,26 +373,38 @@ confirm() {
   esac
 }
 
-# root_exec <n> <type> <sha> <title> <payload>
+# Show root output live, without the sentinel and with control
+# characters made visible. The raw bytes still go to the agent.
+show_live() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ "$line" = "$SENTINEL" ] && continue
+    printf '%s\n' "$(printf '%s' "$line" | sanitize)"
+  done
+}
+
+# root_exec <n> <type> <sha> <title> <payload> <cwd>
 # Runs <payload> as root in one sudo call, with sudo -k before and after.
 # Output is shown live and kept in ROOT_OUTPUT (without the sentinel).
 # Returns the payload's exit code. ROOT_STARTED is 0 if sudo never started it.
 ROOT_OUTPUT=""
 ROOT_STARTED=0
+RUN_TMP=""
 root_exec() {
-  local n="$1" type="$2" sha="$3" title="$4" payload="$5" tmp raw rc
+  local n="$1" type="$2" sha="$3" title="$4" payload="$5" cwd="$6" raw rc
   mkdir -p "$STATE"
-  tmp="$(mktemp "$STATE/.run.XXXXXX")"
+  RUN_TMP="$(mktemp "$STATE/.run.XXXXXX")"
   sudo -k 2>/dev/null || true
   set +e
   sudo -- bash -c "$ROOT_WRAPPER" sudo-inbox "$ROOT_LOG" "$(id -un)" "$n" "$type" "$sha" \
-    "$(printf '%s' "$title" | sanitize)" "$payload" 2>&1 \
-    | tee "$tmp" | grep --line-buffered -v -x -F "$SENTINEL"
+    "$(printf '%s' "$title" | sanitize line)" "$payload" "$cwd" 2>&1 \
+    | tee "$RUN_TMP" | show_live
   rc="${PIPESTATUS[0]}"
   set -e
   sudo -k 2>/dev/null || true
-  IFS= read -r -d '' raw <"$tmp" || true
-  rm -f "$tmp"
+  IFS= read -r -d '' raw <"$RUN_TMP" || true
+  rm -f "$RUN_TMP"
+  RUN_TMP=""
   if [[ "$raw" != *"$SENTINEL"$'\n'* ]]; then
     ROOT_OUTPUT=""
     ROOT_STARTED=0
@@ -369,9 +415,23 @@ root_exec() {
   return "$rc"
 }
 
+# Hangup or Ctrl-C while root code runs: the script may have run partly.
+RUN_ENTRY=""
+on_interrupt() {
+  trap - HUP INT TERM
+  sudo -k 2>/dev/null || true
+  [ -z "$RUN_TMP" ] || rm -f "$RUN_TMP"
+  if [ -n "$RUN_ENTRY" ]; then
+    entry_set "$RUN_ENTRY" status interrupted
+    entry_set "$RUN_ENTRY" finished "$(now_utc)"
+    log_user "interrupted #$RUN_ENTRY"
+  fi
+  exit 130
+}
+
 cmd_run() {
   [ "$#" -le 1 ] || die 2 "usage: sudo-inbox run [<n>]"
-  local n="${1:-}" status content sha rc=0
+  local n="${1:-}" status content sha title cwd rc=0
   if [ -z "$n" ]; then
     n="$(oldest_pending)"
     if [ -z "$n" ]; then
@@ -381,13 +441,19 @@ cmd_run() {
   fi
   require_entry "$n"
   status="$(entry_get "$n" status)"
-  [ "$status" = pending ] || die 5 "entry #$n is $status"
+  if [ "$status" = interrupted ] || [ "$status" = running ]; then
+    die 5 "entry #$n is $status: it may have run partly.
+Check the system, then reject it or queue it again."
+  fi
+  [ "$status" = pending ] || die 5 "entry #$n is $(printf '%s' "$status" | sanitize line)"
   if [ "$(entry_get "$n" type)" = secret ]; then
     run_secret "$n"
     return 0
   fi
 
   IFS= read -r -d '' content <"$(entry_dir "$n")/script" || true
+  title="$(entry_get "$n" title)"
+  cwd="$(entry_get "$n" cwd)"
   sha="$(sha256_of "$content")"
   render_entry "$n" "$content"
   if ! confirm; then
@@ -395,8 +461,13 @@ cmd_run() {
     return 0
   fi
 
-  root_exec "$n" script "$sha" "$(entry_get "$n" title)" "$content" || rc=$?
+  entry_set "$n" status running
+  RUN_ENTRY="$n"
+  trap on_interrupt HUP INT TERM
+  root_exec "$n" script "$sha" "$title" "$content" "${cwd:-/}" || rc=$?
+  trap - HUP INT TERM
   if [ "$ROOT_STARTED" -eq 0 ]; then
+    entry_set "$n" status pending
     die 6 "sudo authentication failed. Entry #$n stays pending.
 Run it in a terminal (e.g. a second SSH tab): sudo-inbox run $n"
   fi
@@ -427,9 +498,13 @@ print_result() {
   local n="$1" status code
   status="$(entry_get "$n" status)"
   case "$status" in
-    pending)
-      echo "status: pending"
+    pending | running)
+      echo "status: $status"
       return 0
+      ;;
+    interrupted)
+      echo "status: interrupted (it may have run partly)"
+      return 1
       ;;
     rejected)
       echo "status: rejected"
@@ -472,7 +547,7 @@ cmd_wait() {
   require_entry "$n"
   secs="$(parse_duration "$timeout")" || die 2 "bad timeout: $timeout (use e.g. 90s, 20m, 1h)"
   deadline=$((SECONDS + secs))
-  while [ "$(entry_get "$n" status)" = pending ]; do
+  while [[ "$(entry_get "$n" status)" =~ ^(pending|running)$ ]]; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       echo "status: pending (timed out after $timeout)"
       return 4
@@ -486,18 +561,36 @@ cmd_wait() {
 # Secrets
 # ---------------------------------------------------------------------------
 
-# Runs as the user or as root with the arguments set in front of it.
-# Reads the already quoted value from stdin, never from argv.
+# Runs as the user or as root with the arguments set in front of it:
+# $1 file, $2 key, $3 mode, $4 owner (empty: keep), $5 invoking user,
+# $6 expected real directory (root only). Reads the already quoted value
+# from stdin, never from argv. Exit 5 means refused.
 # shellcheck disable=SC2016 # expanded by the writer shell, not here
 ENV_WRITER='
-f="$1" key="$2" mode="$3" owner="$4"
+set -e
+f="$1" key="$2" mode="$3" owner="$4" me="$5" realdir="$6"
+dir="$(dirname -- "$f")"
+fail() { echo "sudo-inbox: $1" >&2; exit "${2:-5}"; }
+if [ -n "$realdir" ] && [ "$(realpath -e -- "$dir")" != "$realdir" ]; then
+  fail "refused: $dir changed"
+fi
+[ ! -L "$f" ] || fail "refused: $f is a symlink"
+[ ! -e "$f" ] || [ -f "$f" ] || fail "refused: $f is not a regular file"
 IFS= read -r val
-tmp="$(mktemp "$(dirname "$f")/.sudo-inbox-env.XXXXXX")"
-if [ -f "$f" ]; then grep -v -e "^$key=" "$f" >"$tmp" || true; fi
+tmp="$(mktemp "$dir/.sudo-inbox-env.XXXXXX")" || fail "cannot write in $dir" 1
+trap '"'"'rm -f "$tmp"'"'"' EXIT
+if [ -e "$f" ]; then
+  [ -r "$f" ] || fail "cannot read $f" 1
+  [ -n "$owner" ] || owner="$(stat -c %U:%G -- "$f")"
+  grep -v -E -e "^(export[[:space:]]+)?$key=" -- "$f" >"$tmp" \
+    || [ "$?" -le 1 ] || fail "cannot read $f" 1
+fi
+[ -n "$owner" ] || owner="$me"
 printf "%s=%s\n" "$key" "$val" >>"$tmp"
 chmod "$mode" "$tmp"
 chown "$owner" "$tmp"
 mv -f "$tmp" "$f"
+trap - EXIT
 '
 
 S_NAME="" S_ENV="" S_MIN=1 S_MAX=4096 S_OWNER="" S_MODE=600
@@ -523,7 +616,31 @@ parse_secret_args() {
   [ -n "$S_ENV" ] || die 2 "--env <path> is required"
   [[ "$S_MIN" =~ ^[0-9]+$ && "$S_MAX" =~ ^[0-9]+$ ]] || die 2 "--min/--max need numbers"
   [[ "$S_MODE" =~ ^[0-7]{3,4}$ ]] || die 2 "--mode needs an octal mode like 600"
+  valid_owner "$S_OWNER" || die 2 "--owner needs user or user:group"
   [[ "$S_ENV" == /* ]] || S_ENV="$PWD/$S_ENV"
+}
+
+valid_owner() { [ -z "$1" ] || [[ "$1" =~ ^[a-z_][a-z0-9_.-]*(:[a-z_][a-z0-9_.-]*)?$ ]]; }
+
+# Validate secret parameters read back from disk (the agent can edit them).
+validate_secret() {
+  local name="$1" path="$2" min="$3" max="$4" owner="$5" mode="$6"
+  [[ "$name" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die 5 "refused: invalid NAME in entry"
+  [[ "$min" =~ ^[0-9]+$ && "$max" =~ ^[0-9]+$ ]] || die 5 "refused: invalid length limits"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die 5 "refused: invalid mode in entry"
+  valid_owner "$owner" || die 5 "refused: invalid owner in entry"
+  [[ "$path" == /* ]] || die 5 "refused: path must be absolute"
+  check_env_path "$path"
+}
+
+# True if the user can write <dir> or any directory above it.
+writable_ancestor() {
+  local d="$1"
+  while :; do
+    [ -w "$d" ] && return 0
+    [ "$d" = / ] && return 1
+    d="$(dirname -- "$d")"
+  done
 }
 
 check_env_path() {
@@ -543,10 +660,6 @@ env_quote() {
   fi
 }
 
-default_owner() {
-  if [ -e "$1" ]; then stat -c '%U:%G' "$1"; else printf '%s:%s' "$(id -un)" "$(id -gn)"; fi
-}
-
 # Ask for the value, validate it and write it. Sets SECRET_LEN.
 SECRET_LEN=0
 write_secret() {
@@ -561,16 +674,27 @@ write_secret() {
     die 5 "length ${#v1} is outside $min..$max"
   fi
   [[ "$v1" != *"'"* ]] || die 5 "refused: single quotes are not supported"
-  [ -n "$owner" ] || owner="$(default_owner "$path")"
-  payload="$(printf 'set -e; set -- %q %q %q %q\n' "$path" "$name" "$mode" "$owner")$ENV_WRITER"
-  local dir
-  dir="$(dirname "$path")"
-  if [ -w "$dir" ] && { [ ! -e "$path" ] || [ -w "$path" ]; }; then
+  local dir me
+  dir="$(dirname -- "$path")"
+  me="$(id -un):$(id -gn)"
+  if [ -w "$dir" ]; then
+    # You (and an agent running as you) control this directory anyway.
+    if [ -n "$owner" ] && [ "${owner%%:*}" != "$(id -un)" ]; then
+      die 5 "refused: $dir is writable by you, so owner $owner
+cannot protect the file. Use a root-owned directory."
+    fi
+    payload="$(printf 'set -- %q %q %q %q %q ""\n' "$path" "$name" "$mode" "$owner" "$me")$ENV_WRITER"
     bash -c "$payload" sudo-inbox-secret < <(env_quote "$v1"; echo) || rc=$?
+  elif writable_ancestor "$dir"; then
+    die 5 "refused: a parent of $dir is writable by you,
+so root cannot write there safely"
   else
-    root_exec - secret - "Set $name in $path" "$payload" < <(env_quote "$v1"; echo) || rc=$?
+    payload="$(printf 'set -- %q %q %q %q %q %q\n' "$path" "$name" "$mode" "$owner" "$me" \
+      "$(realpath -e -- "$dir")")$ENV_WRITER"
+    root_exec - secret - "Set $name in $path" "$payload" / < <(env_quote "$v1"; echo) || rc=$?
     [ "$ROOT_STARTED" -eq 1 ] || die 6 "sudo authentication failed. Nothing was written."
   fi
+  [ "$rc" -ne 5 ] || die 5 "refused: nothing was written to $path"
   [ "$rc" -eq 0 ] || die 1 "could not write $path"
   SECRET_LEN="${#v1}"
 }
@@ -603,26 +727,37 @@ cmd_add_secret() {
 
 render_secret() {
   local n="$1" owner
-  owner="$(entry_get "$n" owner)"
+  owner="$(field "$n" owner)"
   render_header "$n"
   printf '%s\n' "$RULE_LIGHT"
-  printf 'Set secret %s\n' "$(entry_get "$n" name)"
-  printf 'File: %s\n' "$(entry_get "$n" env | sanitize)"
-  printf 'Mode: %s  Owner: %s\n' "$(entry_get "$n" mode)" "${owner:-file owner or you}"
+  printf 'Set secret %s\n' "$(field "$n" name)"
+  printf 'File: %s\n' "$(field "$n" env)"
+  printf 'Mode: %s  Owner: %s\n' "$(field "$n" mode)" "${owner:-file owner or you}"
   printf '%s\n' "$RULE_HEAVY"
 }
 
 run_secret() {
-  local n="$1" path
+  local n="$1" name path min max owner mode
+  # Read every field once, validate, show and write exactly these values.
+  name="$(entry_get "$n" name)"
   path="$(entry_get "$n" env)"
-  render_secret "$n"
+  min="$(entry_get "$n" min)"
+  max="$(entry_get "$n" max)"
+  owner="$(entry_get "$n" owner)"
+  mode="$(entry_get "$n" mode)"
+  validate_secret "$name" "$path" "$min" "$max" "$owner" "$mode"
+  render_header "$n"
+  printf '%s\n' "$RULE_LIGHT"
+  printf 'Set secret %s\n' "$name"
+  printf 'File: %s\n' "$(printf '%s' "$path" | sanitize line)"
+  printf 'Mode: %s  Owner: %s\n' "$mode" "${owner:-file owner or you}"
+  printf '%s\n' "$RULE_HEAVY"
   if ! confirm; then
     echo "Not run. Entry #$n stays pending."
     return 0
   fi
   check_env_path "$path"
-  write_secret "$(entry_get "$n" name)" "$path" "$(entry_get "$n" min)" \
-    "$(entry_get "$n" max)" "$(entry_get "$n" owner)" "$(entry_get "$n" mode)"
+  write_secret "$name" "$path" "$min" "$max" "$owner" "$mode"
   entry_set "$n" output "set, length $SECRET_LEN"
   entry_set "$n" exit_code 0
   entry_set "$n" finished "$(now_utc)"

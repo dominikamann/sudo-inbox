@@ -9,3 +9,11 @@ setup() {
   unset SUDO_INBOX_NOTIFY SI_TEST_SUDO_FAIL SI_TEST_SUDO_BEFORE SI_TEST_PASSWORDLESS
   ENTRIES="$XDG_STATE_HOME/sudo-inbox/entries"
 }
+
+# Fails if the stub sudo was asked to run anything as root.
+no_root_call() {
+  if [ -e "$SI_TEST_SUDO_CALLS" ] && grep -q -- '-- bash -c' "$SI_TEST_SUDO_CALLS"; then
+    return 1
+  fi
+  return 0
+}

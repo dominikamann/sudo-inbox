@@ -89,3 +89,67 @@ load helpers/common
   run "$SI" list
   [ "$output" = "Inbox is empty." ]
 }
+
+@test "header fields from disk are sanitized (status, type, created)" {
+  echo true | "$SI" add T
+  printf 'pending\033[1;2r' >"$ENTRIES/1/status"
+  printf 'script\033[2J' >"$ENTRIES/1/type"
+  printf '2026\033[H' >"$ENTRIES/1/created"
+  run "$SI" show 1
+  [[ "$output" != *$'\033'* ]]
+  run "$SI" list
+  [[ "$output" != *$'\033'* ]]
+}
+
+@test "newlines and tabs in title and reason are shown visibly" {
+  echo true | "$SI" add $'line1\nChecks by sudo-inbox:' --reason $'a\tb'
+  run "$SI" show 1
+  [[ "$output" == *'line1^JChecks by sudo-inbox:'* ]]
+  [[ "$output" == *'a^Ib'* ]]
+}
+
+@test "C1 control characters are shown visibly" {
+  printf 'echo \xc2\x9b2J\n' | "$SI" add $'t\xc2\x9b2J'
+  run "$SI" show 1
+  [[ "$output" != *$'\xc2\x9b'* ]]
+  [[ "$output" == *'t<U+009B>2J'* ]]
+  [[ "$output" == *'echo <U+009B>2J'* ]]
+}
+
+@test "bidi overrides are shown visibly and flagged" {
+  printf 'echo ok \xe2\x80\xae# hidden\n' | "$SI" add T
+  run "$SI" show 1
+  [[ "$output" == *'<U+202E>'* ]]
+  [[ "$output" == *"! line 1: hidden text direction (bidi)"* ]]
+}
+
+@test "relative and home paths are flagged" {
+  printf 'bash ./install.sh\ncp ~/x /opt/x\n' | "$SI" add T
+  run "$SI" show 1
+  [[ "$output" == *"! line 1: uses a file the agent can change"* ]]
+  [[ "$output" == *"! line 2: uses a file the agent can change"* ]]
+}
+
+@test "show displays the directory the script runs in" {
+  mkdir -p "$BATS_TEST_TMPDIR/proj"
+  cd "$BATS_TEST_TMPDIR/proj"
+  echo true | "$SI" add T
+  run "$SI" show 1
+  [[ "$output" == *"Runs in: $BATS_TEST_TMPDIR/proj"* ]]
+}
+
+@test "secret header fields are sanitized" {
+  "$SI" add-secret K --env "$BATS_TEST_TMPDIR/.env"
+  printf 'K\033[2J' >"$ENTRIES/1/name"
+  printf '600\033[H' >"$ENTRIES/1/mode"
+  printf 'me\033[1;2r' >"$ENTRIES/1/owner"
+  run "$SI" show 1
+  [[ "$output" != *$'\033'* ]]
+}
+
+@test "script over 120 KiB is refused" {
+  head -c 130000 /dev/zero | tr '\0' a >"$BATS_TEST_TMPDIR/big"
+  run "$SI" add T -f "$BATS_TEST_TMPDIR/big"
+  [ "$status" -eq 5 ]
+  [[ "$output" == *"max 120 KiB"* ]]
+}
