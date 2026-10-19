@@ -17,7 +17,8 @@ You cannot run sudo, su, doas or pkexec yourself. When something needs root:
    1 = script failed or interrupted, 3 = rejected with a reason, 4 = the user has not answered
    yet: run the same `wait` again). Read the output before you continue.
 
-For passwords and API keys never ask the user to paste them into the chat. Use
+For passwords and API tokens never ask the user to paste them into the chat. Use
 `sudo-inbox add-secret <NAME> --env <path to .env>` and wait for it the same way.
-You will only learn that the value was set and its length.
+You will only learn that the value was set and its length. Load it with
+`set -a; . <path to .env>; set +a` and never print, cat or echo the value.
 ```

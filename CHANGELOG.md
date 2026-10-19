@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- README: API token example (Jira) and sponsor link; agent instructions say how to load a
+  secret without printing it.
+
 ## [0.1.0]
 
 ### Added

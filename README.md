@@ -6,6 +6,7 @@
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen?style=flat-square)](sudo-inbox)
 [![ShellCheck](https://img.shields.io/badge/shellcheck-clean-brightgreen?style=flat-square)](https://www.shellcheck.net)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
+[![Sponsor](https://img.shields.io/badge/support-me-ff5e5b?style=flat-square&logo=ko-fi)](https://github.com/sponsors/dominikamann)
 
 **Your agent needs root. You're on the couch.**
 
@@ -31,7 +32,7 @@ output back. Passwords for services end up in the chat or twice in a `.env`.
 | Agent pastes commands into the chat | Agent queues a script with title and reason |
 | Multi-line commands break when you copy them | You run `sudo-inbox run 3`, nothing to copy |
 | You copy the output back to the agent | The agent reads the result with `sudo-inbox wait 3` |
-| Service passwords land in the chat | `add-secret` asks you for the value, the agent sees only "set, length 20" |
+| API tokens and passwords land in the chat | `add-secret` asks you for the value, the agent sees only "set, length 20" |
 | Agent keeps trying `sudo` and fails | A hook tells it to use the inbox |
 
 ## Features
@@ -39,7 +40,9 @@ output back. Passwords for services end up in the chat or twice in a `.env`.
 **For the agent**
 - `add` queues a script from stdin or a file and returns the entry number.
 - `wait` blocks until you have handled it, then prints status, exit code and output.
-- `add-secret` asks you to set a secret in a `.env` file without ever seeing the value.
+- `add-secret` asks you for an API token or password (Jira, GitHub, a database …) and stores it
+  in a `.env` file. No pasting into the chat, no command to fill in: you run one command and
+  paste the token at a hidden prompt.
 
 **For you**
 - `run` shows the title and reason (marked as the agent's words), the directory the script runs
@@ -170,6 +173,27 @@ never run again; check the system and queue a new entry.
 Other commands exit with `0` on success, `2` for usage errors, `5` when something is refused
 (missing entry, wrong state, path or validation rules) and `6` when sudo did not run anything
 (wrong password, no terminal).
+
+### API tokens: the agent needs one, you never paste it into the chat
+
+This needs no root at all. Say your agent has to talk to Jira:
+
+```bash
+# agent
+sudo-inbox add-secret JIRA_API_TOKEN --env ~/work/jira-bot/.env --min 20
+sudo-inbox wait 7 --timeout 9m
+
+# you, in your own terminal: one command, then paste the token at the hidden prompt
+sudo-inbox run 7
+
+# agent: load it without ever printing it
+set -a; . ~/work/jira-bot/.env; set +a
+curl -s -u "me@example.com:$JIRA_API_TOKEN" https://example.atlassian.net/rest/api/3/myself
+```
+
+The token never appears in the chat, the transcript or a command line. An agent running as
+your user could still read the file, so this keeps tokens out of the conversation, not out of
+reach (see [Secrets](#secrets) for how to keep one from the agent entirely).
 
 ### Secrets
 
