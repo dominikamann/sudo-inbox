@@ -631,6 +631,141 @@ run_secret() {
 }
 
 # ---------------------------------------------------------------------------
+# Hook
+# ---------------------------------------------------------------------------
+
+HOOK_MESSAGE='Blocked by sudo-inbox: this needs root.
+Do not run sudo, su, doas or pkexec directly.
+1. Put the commands in a small script with one purpose.
+2. Queue it: sudo-inbox add "<title>" --reason "<why>" < script.sh
+3. Ask the user to run this in their own terminal: sudo-inbox run <n>
+4. Then read the result: sudo-inbox wait <n>
+For passwords use: sudo-inbox add-secret <NAME> --env <path>'
+
+# json_get_string <key>: first string value of "<key>" in the JSON on stdin.
+json_get_string() {
+  local LC_ALL=C json rest out="" c i=1
+  IFS= read -r -d '' json || true
+  rest="${json#*"\"$1\""}"
+  [ "$rest" != "$json" ] || return 1
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  [ "${rest:0:1}" = ":" ] || return 1
+  rest="${rest:1}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  [ "${rest:0:1}" = '"' ] || return 1
+  while [ "$i" -lt "${#rest}" ]; do
+    c="${rest:i:1}"
+    if [ "$c" = "\\" ]; then
+      i=$((i + 1))
+      c="${rest:i:1}"
+      case "$c" in
+        n) out+=$'\n' ;;
+        t) out+=$'\t' ;;
+        r) out+=$'\r' ;;
+        '"' | "\\" | /) out+="$c" ;;
+        *) out+="\\$c" ;;
+      esac
+    elif [ "$c" = '"' ]; then
+      printf '%s' "$out"
+      return 0
+    else
+      out+="$c"
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# hook_check <command>: 0 if allowed, 1 if it runs a privileged command
+# that would need a password.
+hook_check() {
+  local cmd="$1" seg sep i w base
+  local -a words
+  # shellcheck disable=SC2016 # literal separators
+  for sep in '$(' '&&' '||' ';' '|' '&' '(' ')' '`'; do
+    cmd="${cmd//"$sep"/$'\n'}"
+  done
+  while IFS= read -r seg; do
+    read -ra words <<<"$seg"
+    i=0
+    while [ "$i" -lt "${#words[@]}" ]; do
+      w="${words[$i]}"
+      if [[ "$w" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+        i=$((i + 1))
+        continue
+      fi
+      case "$w" in
+        then | do | else | exec | env | nohup | time | xargs | nice | ionice) i=$((i + 1)); continue ;;
+        timeout)
+          i=$((i + 1))
+          while [[ "${words[$i]:-}" == -* ]]; do i=$((i + 1)); done
+          i=$((i + 1))
+          continue
+          ;;
+      esac
+      break
+    done
+    [ "$i" -lt "${#words[@]}" ] || continue
+    base="${words[$i]##*/}"
+    case "$base" in
+      su | doas | pkexec) return 1 ;;
+      sudo)
+        case "${words[$((i + 1))]:-}" in
+          -n | -l | -k | -K) continue ;;
+        esac
+        sudo -n -l "${words[@]:$((i + 1))}" >/dev/null 2>&1 || return 1
+        ;;
+    esac
+  done <<<"$cmd"
+  return 0
+}
+
+cmd_hook() {
+  [ "${1:-}" = claude-code ] || die 2 "usage: sudo-inbox hook claude-code"
+  local input tool command
+  IFS= read -r -d '' input || true
+  tool="$(json_get_string tool_name <<<"$input")" || return 0
+  [ "$tool" = Bash ] || return 0
+  command="$(json_get_string command <<<"$input")" || return 0
+  if ! hook_check "$command"; then
+    printf '%s\n' "$HOOK_MESSAGE" >&2
+    exit 2
+  fi
+}
+
+cmd_install_hook() {
+  [ "${1:-}" = claude-code ] || die 2 "usage: sudo-inbox install-hook claude-code"
+  local self settings snippet
+  self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  settings="$HOME/.claude/settings.json"
+  snippet="{
+  \"hooks\": {
+    \"PreToolUse\": [
+      {
+        \"matcher\": \"Bash\",
+        \"hooks\": [
+          { \"type\": \"command\", \"command\": \"$self hook claude-code\" }
+        ]
+      }
+    ]
+  }
+}"
+  if [ ! -e "$settings" ]; then
+    mkdir -p "$(dirname "$settings")"
+    printf '%s\n' "$snippet" >"$settings"
+    echo "Hook installed in $settings."
+    return 0
+  fi
+  if grep -q 'sudo-inbox hook claude-code' "$settings"; then
+    echo "Hook already installed."
+    return 0
+  fi
+  printf '%s\n' "$snippet"
+  echo "Add this to \"hooks\" → \"PreToolUse\" in $settings."
+  exit 5
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -653,6 +788,8 @@ main() {
     wait) cmd_wait "$@" ;;
     secret) cmd_secret "$@" ;;
     add-secret) cmd_add_secret "$@" ;;
+    hook) cmd_hook "$@" ;;
+    install-hook) cmd_install_hook "$@" ;;
     *) die 2 "unknown command: $cmd (see: sudo-inbox help)" ;;
   esac
 }
