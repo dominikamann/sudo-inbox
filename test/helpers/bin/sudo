@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Stub sudo for tests. Behaviour is controlled by SI_TEST_* variables,
+# which only this stub reads.
+printf '%s\n' "$*" >>"${SI_TEST_SUDO_CALLS:-/dev/null}"
+
+if [ "${1:-}" = "-k" ] || [ "${1:-}" = "-K" ]; then
+  exit 0
+fi
+
+if [ "${1:-}" = "-n" ] && [ "${2:-}" = "-l" ]; then
+  shift 2
+  for allowed in ${SI_TEST_PASSWORDLESS:-}; do
+    [ "${1:-}" = "$allowed" ] && exit 0
+  done
+  exit 1
+fi
+
+if [ "${SI_TEST_SUDO_FAIL:-}" = "1" ]; then
+  echo "Sorry, try again." >&2
+  exit 1
+fi
+
+[ "${1:-}" = "--" ] && shift
+args=()
+for a in "$@"; do
+  if [ "$a" = "/var/log/sudo-inbox.log" ]; then
+    args+=("$SI_TEST_ROOT_LOG")
+  else
+    args+=("$a")
+  fi
+done
+
+if [ -n "${SI_TEST_SUDO_BEFORE:-}" ]; then
+  bash -c "$SI_TEST_SUDO_BEFORE"
+fi
+
+exec "${args[@]}"

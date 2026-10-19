@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# sudo-inbox: let agents queue root work, approve it yourself.
+# https://github.com/dominikamann/sudo-inbox · MIT License
+set -euo pipefail
+
+if [ -z "${BASH_VERSINFO[0]:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "sudo-inbox: bash 4 or newer is required" >&2
+  exit 2
+fi
+
+VERSION="0.1.0"
+# shellcheck disable=SC2034 # used from Task 2 on
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/sudo-inbox"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+die() {
+  local code="$1"
+  shift
+  printf 'sudo-inbox: %s\n' "$*" >&2
+  exit "$code"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: sudo-inbox <command> [args]
+
+For agents:
+  add <title> [--reason <text>] [-f <file>]
+              Queue a script (stdin or -f).
+  add-secret <NAME> --env <path> [options]
+              Ask the user to set a secret.
+  wait <n> [--timeout 20m]
+              Block until entry n is handled.
+  result <n>  Print status and output of n.
+
+For you:
+  list        Show waiting and recent entries.
+  show <n>    Show entry n in full.
+  run [<n>]   Review and run n (default: oldest).
+  reject <n> [<reason>]
+              Decline entry n.
+  secret <NAME> --env <path> [options]
+              Set a secret in a .env file.
+
+Setup:
+  hook claude-code
+              Claude Code PreToolUse hook.
+  install-hook claude-code
+              Install that hook.
+  help, version
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+  if [ "$#" -eq 0 ]; then
+    usage
+    exit 2
+  fi
+  local cmd="$1"
+  shift
+  case "$cmd" in
+    help | -h | --help) usage ;;
+    version | --version) echo "sudo-inbox $VERSION" ;;
+    *) die 2 "unknown command: $cmd (see: sudo-inbox help)" ;;
+  esac
+}
+
+main "$@"
