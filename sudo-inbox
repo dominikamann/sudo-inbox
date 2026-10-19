@@ -15,6 +15,21 @@ MAX_SCRIPT_BYTES=262144
 LONG_SCRIPT_LINES=60
 RULE_HEAVY="════════════════════════════════════════"
 RULE_LIGHT="────────────────────────────────────────"
+ROOT_LOG="/var/log/sudo-inbox.log"
+SENTINEL="__SUDO_INBOX_STARTED__"
+
+# Runs as root through one sudo call. Arguments:
+# $1 log path, $2 user, $3 entry, $4 type, $5 sha256, $6 title, $7 payload.
+# The sentinel proves that sudo got past authentication.
+# shellcheck disable=SC2016 # expanded by the root shell, not here
+ROOT_WRAPPER='
+echo "'"$SENTINEL"'"
+bash -c "$7" "sudo-inbox-$3"
+rc=$?
+printf "%s user=%s entry=%s type=%s sha256=%s exit=%s title=%s\n" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$3" "$4" "$5" "$rc" "$6" >>"$1"
+exit "$rc"
+'
 
 # Risky patterns (extended regex) and their labels, checked line by line.
 RISK_PATTERNS=(
@@ -282,6 +297,105 @@ cmd_show() {
   render_entry "$1"
 }
 
+oldest_pending() {
+  local n
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    if [ "$(entry_get "$n" status)" = pending ]; then
+      printf '%s' "$n"
+      return 0
+    fi
+  done < <(entry_numbers | sort -n)
+}
+
+confirm() {
+  local answer=""
+  printf 'Run it? [y/N] '
+  IFS= read -r answer || true
+  case "$answer" in
+    y | Y | yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# root_exec <n> <type> <sha> <title> <payload>
+# Runs <payload> as root in one sudo call, with sudo -k before and after.
+# Output is shown live and kept in ROOT_OUTPUT (without the sentinel).
+# Returns the payload's exit code. ROOT_STARTED is 0 if sudo never started it.
+ROOT_OUTPUT=""
+ROOT_STARTED=0
+root_exec() {
+  local n="$1" type="$2" sha="$3" title="$4" payload="$5" tmp raw rc
+  tmp="$(mktemp "$(entry_dir "$n")/.run.XXXXXX")"
+  sudo -k 2>/dev/null || true
+  set +e
+  sudo -- bash -c "$ROOT_WRAPPER" sudo-inbox "$ROOT_LOG" "$(id -un)" "$n" "$type" "$sha" \
+    "$(printf '%s' "$title" | sanitize)" "$payload" 2>&1 \
+    | tee "$tmp" | grep --line-buffered -v -x -F "$SENTINEL"
+  rc="${PIPESTATUS[0]}"
+  set -e
+  sudo -k 2>/dev/null || true
+  IFS= read -r -d '' raw <"$tmp" || true
+  rm -f "$tmp"
+  if [[ "$raw" != *"$SENTINEL"$'\n'* ]]; then
+    ROOT_OUTPUT=""
+    ROOT_STARTED=0
+    return 6
+  fi
+  ROOT_STARTED=1
+  ROOT_OUTPUT="${raw#*"$SENTINEL"$'\n'}"
+  return "$rc"
+}
+
+cmd_run() {
+  [ "$#" -le 1 ] || die 2 "usage: sudo-inbox run [<n>]"
+  local n="${1:-}" status content sha rc=0
+  if [ -z "$n" ]; then
+    n="$(oldest_pending)"
+    if [ -z "$n" ]; then
+      echo "Inbox is empty."
+      return 0
+    fi
+  fi
+  require_entry "$n"
+  status="$(entry_get "$n" status)"
+  [ "$status" = pending ] || die 5 "entry #$n is $status"
+
+  IFS= read -r -d '' content <"$(entry_dir "$n")/script" || true
+  sha="$(sha256_of "$content")"
+  render_entry "$n" "$content"
+  if ! confirm; then
+    echo "Not run. Entry #$n stays pending."
+    return 0
+  fi
+
+  root_exec "$n" script "$sha" "$(entry_get "$n" title)" "$content" || rc=$?
+  if [ "$ROOT_STARTED" -eq 0 ]; then
+    die 6 "sudo authentication failed. Entry #$n stays pending.
+Run it in a terminal (e.g. a second SSH tab): sudo-inbox run $n"
+  fi
+  printf '%s' "$ROOT_OUTPUT" >"$(entry_dir "$n")/output"
+  entry_set "$n" exit_code "$rc"
+  entry_set "$n" sha256 "$sha"
+  entry_set "$n" finished "$(now_utc)"
+  entry_set "$n" status "done"
+  log_user "ran #$n exit=$rc"
+  echo "Done. Exit code $rc. The agent can read it with: sudo-inbox result $n"
+}
+
+cmd_reject() {
+  if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then die 2 "usage: sudo-inbox reject <n> [<reason>]"; fi
+  require_entry "$1"
+  local status
+  status="$(entry_get "$1" status)"
+  [ "$status" = pending ] || die 5 "entry #$1 is $status"
+  entry_set "$1" reject_reason "${2:-}"
+  entry_set "$1" finished "$(now_utc)"
+  entry_set "$1" status rejected
+  log_user "rejected #$1"
+  echo "Entry #$1 rejected."
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -299,6 +413,8 @@ main() {
     add) cmd_add "$@" ;;
     list) cmd_list "$@" ;;
     show) cmd_show "$@" ;;
+    run) cmd_run "$@" ;;
+    reject) cmd_reject "$@" ;;
     *) die 2 "unknown command: $cmd (see: sudo-inbox help)" ;;
   esac
 }
