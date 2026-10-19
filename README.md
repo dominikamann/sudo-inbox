@@ -55,7 +55,7 @@ output back. Passwords for services end up in the chat or twice in a `.env`.
 - What you saw is exactly what runs: the script is read once into memory and executed from there.
 - `sudo -k` before and after every run, so every approval asks for your password.
 - A dropped SSH session marks the entry `interrupted` instead of offering it again.
-- One root-owned audit log line per approval: time, entry, hash, exit code.
+- One root-owned audit log line per approval that uses sudo: time, entry, hash, exit code.
 - No dependencies besides bash ≥ 4, coreutils and sudo. One file you can read in one sitting.
 
 ## How it works
@@ -93,13 +93,55 @@ output back. Passwords for services end up in the chat or twice in a `.env`.
    There is deliberately no `curl | sh` one-liner. This tool exists so that nothing runs as root
    unread, and its installer should not be the exception. Install it root-owned so the agent
    cannot change it.
-2. Teach your agent:
-   ```bash
-   sudo-inbox install-hook claude-code   # Claude Code: redirects sudo/su/doas/pkexec to the inbox
-   ```
-   For other agents paste the block from [docs/agent-instructions.md](docs/agent-instructions.md)
-   into `AGENTS.md` or your agent's instructions.
+2. Connect your agent: see [Integrations](#integrations) for Claude Code, Codex and others.
 3. Optional: get a ping when something is waiting (see [Notifications](#notifications)).
+
+## Integrations
+
+### Claude Code
+
+1. Install the hook. It runs before every Bash command and redirects `sudo`, `su`, `doas` and
+   `pkexec` to the inbox, while commands covered by a `NOPASSWD` rule keep working:
+   ```bash
+   sudo-inbox install-hook claude-code
+   ```
+   This creates `~/.claude/settings.json`. If that file already exists, nothing is changed and the
+   command prints the entry to add under `"hooks"` → `"PreToolUse"`:
+   ```json
+   { "matcher": "Bash", "hooks": [ { "type": "command", "command": "/usr/local/bin/sudo-inbox hook claude-code" } ] }
+   ```
+2. Optional but recommended: paste the block from
+   [docs/agent-instructions.md](docs/agent-instructions.md) into your `CLAUDE.md`, so Claude
+   uses the inbox right away instead of finding out through the hook.
+3. Restart Claude Code. Ask it to do something that needs root, then approve it in a second
+   SSH session with `sudo-inbox run <n>`.
+
+### Codex
+
+Codex hooks use the same format, so the same hook works:
+
+1. Install it:
+   ```bash
+   sudo-inbox install-hook codex
+   ```
+   This creates `~/.codex/hooks.json` (or prints the entry to add if the file exists).
+2. In Codex, run `/hooks` once to review and trust the new hook. Codex does not run hooks you
+   have not trusted.
+3. Paste the block from [docs/agent-instructions.md](docs/agent-instructions.md) into your
+   `AGENTS.md`.
+
+### Other agents (OpenCode, Hermes, own scripts, …)
+
+Any agent that can run shell commands can use sudo-inbox. Paste the block from
+[docs/agent-instructions.md](docs/agent-instructions.md) into `AGENTS.md` or the agent's
+instructions. Without a hook nothing stops the agent from trying `sudo`, but without a terminal
+that simply fails, and the instructions tell it what to do instead.
+
+### Waiting for you
+
+Agent tools usually cut off long commands (Claude Code after 2 minutes by default, 10 at most).
+`sudo-inbox wait` therefore waits 9 minutes by default and exits with `4` if you have not
+answered yet. The agent then simply calls `wait` again. The hook and the instructions tell it so.
 
 ## Using it
 
@@ -109,21 +151,25 @@ output back. Passwords for services end up in the chat or twice in a `.env`.
 |---|---|---|
 | `add <title> [--reason <text>] [-f <file>]` | agent | Queue a script (stdin or `-f`), max 120 KiB, runs in the current directory |
 | `add-secret <NAME> --env <path> [options]` | agent | Ask you to set a secret in a `.env` file |
-| `wait <n> [--timeout 20m]` | agent | Block until handled (`90s`, `20m`, `1h`) |
+| `wait <n> [--timeout 9m]` | agent | Block until handled (`90s`, `9m`, `1h`), exit 4 if still waiting |
 | `result <n>` | agent | Status, exit code and output, without waiting |
 | `list` | you | Waiting and recent entries |
 | `show <n>` | you | Entry in full |
 | `run [<n>]` | you | Review and run (default: oldest waiting) |
 | `reject <n> [<reason>]` | you | Decline |
 | `secret <NAME> --env <path> [options]` | you | Set a secret directly |
-| `install-hook claude-code` | you | Install the Claude Code hook |
-| `hook claude-code` | Claude Code | The `PreToolUse` hook itself |
+| `install-hook claude-code\|codex` | you | Install the hook for Claude Code or Codex |
+| `hook claude-code\|codex` | the agent | The `PreToolUse` hook itself |
 
 Secret options: `--min N`, `--max N`, `--owner user:group`, `--mode 600`.
 
 `wait` and `result` exit with `0` (done, script succeeded), `1` (done, script failed, or
 interrupted), `3` (rejected) or `4` (timeout). An interrupted entry may have run partly and is
 never run again; check the system and queue a new entry.
+
+Other commands exit with `0` on success, `2` for usage errors, `5` when something is refused
+(missing entry, wrong state, path or validation rules) and `6` when sudo did not run anything
+(wrong password, no terminal).
 
 ### Secrets
 
@@ -161,7 +207,7 @@ runs in the background and may fail without bothering anyone.
 
 ```bash
 # Matrix (a bot account's access token)
-NOTIFY=curl -s -X PUT -H "Authorization: Bearer $MATRIX_TOKEN" -d "{\"msgtype\":\"m.text\",\"body\":\"sudo-inbox #$1: $2\"}" "https://matrix.example.org/_matrix/client/v3/rooms/!room:example.org/send/m.room.message/si-$1-$(date +%s)"
+NOTIFY=curl -s -X PUT -H "Authorization: Bearer $MATRIX_TOKEN" -d "{\"msgtype\":\"m.text\",\"body\":\"sudo-inbox: entry #$1 is waiting\"}" "https://matrix.example.org/_matrix/client/v3/rooms/!room:example.org/send/m.room.message/si-$1-$(date +%s)"
 # ntfy
 NOTIFY=curl -s -d "sudo-inbox #$1: $2" https://ntfy.sh/your-topic
 # Telegram
@@ -176,7 +222,7 @@ NOTIFY=curl -s https://api.pushover.net/1/messages.json -d token=$PO_TOKEN -d us
 |---|---|---|
 | [sudoplz](https://github.com/crypdick/sudoplz) | Desktop dialog, password stored encrypted to your SSH key | Needs a desktop on the same machine, stores the password |
 | [claude-sudo-askpass](https://github.com/dgutson/claude-sudo-askpass) | Desktop dialog via `SUDO_ASKPASS` | Needs a desktop, Claude Code only |
-| [Hook + `sudo -v`](https://www.dgt.is/blog/2026-03-10-ai-sudo-with-agents/) | Block until you run `sudo -v` elsewhere | The cached login works for every process, no review, no output back |
+| [Hook + `sudo -v`](https://www.dgt.is/blog/2026-03-10-ai-sudo-with-agents/) | Block until you run `sudo -v` elsewhere | One shared sudo login for a while instead of one approval, no review, no output back |
 
 sudo-inbox is built for a server without a screen and a human somewhere else: it shows the
 exact content before it runs, returns the output to the agent and covers service secrets too.

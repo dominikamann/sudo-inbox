@@ -16,18 +16,22 @@ decision easy to take carefully. It does not make an agent trustworthy.
   `Runs in:` on the review screen, not in whatever directory your terminal is in.
 - **No password handling.** sudo asks for the password itself. sudo-inbox never sees, stores or
   forwards it.
-- **No lingering sudo login.** `sudo -k` runs before and after every approval, so the agent cannot
-  reuse a cached login from your approval.
+- **No lingering sudo login.** The approved script runs with `sudo -k`, which asks for the
+  password and does not create a cached login, and `sudo -k` runs again before and after. So no
+  sudo login exists that the agent could reuse, not even while a long script runs.
 - **Honest display.** Every field read from the inbox, the script and the script's live output
   are shown with control characters in caret notation (`^[`), C1 controls and bidi overrides as
   `<U+XXXX>`, and newlines in titles as `^J`. Escape sequences cannot hide lines, repaint the
-  screen or fake the prompt. Title and reason are labelled as the agent's words. The checks
+  screen or fake the prompt. Lines with any non-ASCII character (zero-width spaces,
+  look-alike letters) or more than 200 characters are flagged, and so are entries older than a
+  day. Title and reason are labelled as the agent's words. The checks
   below them come from sudo-inbox itself.
 - **No second run after a dropped session.** The entry is marked `running` before sudo starts.
   A hangup or Ctrl-C marks it `interrupted`, logs that as root, and `run` refuses it from then
   on, because it may have run partly.
-- **Audit log.** Every approval appends one line to `/var/log/sudo-inbox.log` from inside the
-  same root call: time, user, entry, type, hash, exit code and title.
+- **Audit log.** Every approval that uses sudo appends one line to `/var/log/sudo-inbox.log`
+  from inside the same root call: time, user, entry, type, hash, exit code and title. Secrets
+  written into your own directories need no sudo and are only logged in your user log.
 - **Secrets stay out of argv and chat.** Values are read hidden, passed on stdin, and only
   written to `.env` files that are not symlinks. Secret fields are read once, validated, shown
   and written exactly as shown.
@@ -49,7 +53,8 @@ decision easy to take carefully. It does not make an agent trustworthy.
   you do not understand.
 - **Output.** Everything a script prints goes back to the agent. Do not print secrets.
 - **The hook is a nudge, not a wall.** It catches `sudo`, `su`, `doas` and `pkexec` in command
-  position but does not parse quoted strings. The real boundary is sudo's password prompt.
+  position and ignores quoted text, so `bash -c "sudo …"` slips through. The real boundary is
+  sudo's password prompt.
 - **The inbox directory.** It lives in the user's state directory
   (`~/.local/state/sudo-inbox`). An agent with the same user can rewrite statuses or results
   there. That only misleads the agent itself. Your decisions rely on what `run` shows you.
