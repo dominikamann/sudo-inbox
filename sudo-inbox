@@ -396,6 +396,66 @@ cmd_reject() {
   echo "Entry #$1 rejected."
 }
 
+# print_result <n>: status block for agents. Exit code per status.
+print_result() {
+  local n="$1" status code
+  status="$(entry_get "$n" status)"
+  case "$status" in
+    pending)
+      echo "status: pending"
+      return 0
+      ;;
+    rejected)
+      echo "status: rejected"
+      printf 'reason: %s\n' "$(entry_get "$n" reject_reason)"
+      return 3
+      ;;
+  esac
+  code="$(entry_get "$n" exit_code)"
+  printf 'status: %s\nexit_code: %s\n--- output ---\n' "$status" "$code"
+  entry_get "$n" output
+  [ "$code" = 0 ] && return 0
+  return 1
+}
+
+cmd_result() {
+  [ "$#" -eq 1 ] || die 2 "usage: sudo-inbox result <n>"
+  require_entry "$1"
+  print_result "$1"
+}
+
+# Parse <int>[s|m|h] into seconds.
+parse_duration() {
+  [[ "$1" =~ ^([0-9]+)([smh]?)$ ]] || return 1
+  local v="${BASH_REMATCH[1]}"
+  case "${BASH_REMATCH[2]}" in
+    m) v=$((v * 60)) ;;
+    h) v=$((v * 3600)) ;;
+  esac
+  printf '%s' "$v"
+}
+
+cmd_wait() {
+  local n="" timeout="20m" secs deadline
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --timeout) [ "$#" -ge 2 ] || die 2 "--timeout needs a value"; timeout="$2"; shift 2 ;;
+      *) [ -z "$n" ] || die 2 "usage: sudo-inbox wait <n> [--timeout 20m]"; n="$1"; shift ;;
+    esac
+  done
+  require_entry "$n"
+  secs="$(parse_duration "$timeout")" || die 2 "bad timeout: $timeout (use e.g. 90s, 20m, 1h)"
+  deadline=$((SECONDS + secs))
+  while [ "$(entry_get "$n" status)" = pending ]; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "status: pending (timed out after $timeout)"
+      return 4
+    fi
+    sleep 2
+  done
+  print_result "$n"
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -415,6 +475,8 @@ main() {
     show) cmd_show "$@" ;;
     run) cmd_run "$@" ;;
     reject) cmd_reject "$@" ;;
+    result) cmd_result "$@" ;;
+    wait) cmd_wait "$@" ;;
     *) die 2 "unknown command: $cmd (see: sudo-inbox help)" ;;
   esac
 }
