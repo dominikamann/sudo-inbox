@@ -9,8 +9,36 @@ if [ -z "${BASH_VERSINFO[0]:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
 fi
 
 VERSION="0.1.0"
-# shellcheck disable=SC2034 # used from Task 2 on
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/sudo-inbox"
+ENTRIES="$STATE/entries"
+MAX_SCRIPT_BYTES=262144
+LONG_SCRIPT_LINES=60
+RULE_HEAVY="════════════════════════════════════════"
+RULE_LIGHT="────────────────────────────────────────"
+
+# Risky patterns (extended regex) and their labels, checked line by line.
+RISK_PATTERNS=(
+  'rm[[:space:]]+-[a-zA-Z]*[rR][a-zA-Z]*f|rm[[:space:]]+-[a-zA-Z]*f[a-zA-Z]*[rR]'
+  '(^|[[:space:]>])/etc/'
+  '/boot/'
+  '(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(ba|z)?sh'
+  'chmod[[:space:]]+(-R[[:space:]]+)?0?777'
+  'sudoers'
+  'sshd_config|authorized_keys'
+  'systemctl[[:space:]]+(start|stop|restart|enable|disable|mask)'
+  'mkfs|dd[[:space:]]+if=|>[[:space:]]*/dev/sd'
+)
+RISK_LABELS=(
+  'recursive force delete'
+  'writes or touches /etc'
+  'touches /boot'
+  'pipes download into a shell'
+  'world-writable permissions'
+  'sudo configuration'
+  'SSH access'
+  'changes a service'
+  'writes to a disk'
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,6 +82,206 @@ Setup:
 EOF
 }
 
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+log_user() {
+  mkdir -p "$STATE"
+  printf '%s %s\n' "$(now_utc)" "$*" >>"$STATE/log"
+}
+
+# Print stdin with control characters (except newline and tab) in caret
+# notation, so nothing can move the cursor or hide text on the terminal.
+sanitize() {
+  local LC_ALL=C text i ch caret
+  IFS= read -r -d '' text || true
+  for ((i = 1; i < 32; i++)); do
+    [ "$i" -eq 9 ] || [ "$i" -eq 10 ] && continue
+    printf -v ch '%b' "\\$(printf '%03o' "$i")"
+    printf -v caret '^%b' "\\$(printf '%03o' $((i + 64)))"
+    text="${text//"$ch"/"$caret"}"
+  done
+  text="${text//$'\177'/^?}"
+  printf '%s' "$text"
+}
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+
+entry_dir() { printf '%s/%s' "$ENTRIES" "$1"; }
+
+entry_get() {
+  local f
+  f="$(entry_dir "$1")/$2"
+  [ -f "$f" ] && cat "$f"
+  return 0
+}
+
+entry_set() { printf '%s' "$3" >"$(entry_dir "$1")/$2"; }
+
+require_entry() {
+  [[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || die 2 "not an entry number: ${1:-}"
+  [ -d "$(entry_dir "$1")" ] || die 5 "no entry #$1"
+}
+
+# Entry numbers, newest first.
+entry_numbers() {
+  [ -d "$ENTRIES" ] || return 0
+  local d
+  for d in "$ENTRIES"/*; do
+    d="${d##*/}"
+    [[ "$d" =~ ^[1-9][0-9]*$ ]] && printf '%s\n' "$d"
+  done | sort -rn
+}
+
+# Create the next entry directory atomically and print its number.
+new_entry() {
+  mkdir -p "$ENTRIES"
+  local n
+  while :; do
+    n="$(entry_numbers | head -n 1)"
+    n=$((${n:-0} + 1))
+    if mkdir "$(entry_dir "$n")" 2>/dev/null; then
+      entry_set "$n" type "$1"
+      entry_set "$n" status pending
+      entry_set "$n" created "$(now_utc)"
+      printf '%s' "$n"
+      return 0
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+risk_lines() {
+  local line n=0 i
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    for i in "${!RISK_PATTERNS[@]}"; do
+      if [[ "$line" =~ ${RISK_PATTERNS[$i]} ]]; then
+        printf '%s: %s\n' "$n" "${RISK_LABELS[$i]}"
+      fi
+    done
+  done
+}
+
+count_lines() {
+  local content="$1" nl
+  [ -z "$content" ] && { echo 0; return; }
+  nl="${content//[!$'\n']/}"
+  if [ "${content: -1}" = $'\n' ]; then echo "${#nl}"; else echo $((${#nl} + 1)); fi
+}
+
+sha256_of() { printf '%s' "$1" | sha256sum | cut -d ' ' -f 1; }
+
+render_header() {
+  local n="$1"
+  printf '%s\n' "$RULE_HEAVY"
+  printf '#%s  %s  %s  %s\n' "$n" "$(entry_get "$n" status)" \
+    "$(entry_get "$n" type)" "$(entry_get "$n" created)"
+  printf 'Title (from agent): %s\n' "$(entry_get "$n" title | sanitize)"
+  local reason
+  reason="$(entry_get "$n" reason | sanitize)"
+  printf 'Reason (from agent): %s\n' "${reason:--}"
+}
+
+# render_entry <n> [<content>]: full display of an entry. With <content>,
+# that text is rendered instead of the stored script.
+render_entry() {
+  local n="$1" content risks lines line i=0
+  if [ "$#" -ge 2 ]; then
+    content="$2"
+  else
+    IFS= read -r -d '' content <"$(entry_dir "$n")/script" || true
+  fi
+  render_header "$n"
+  printf '%s\n' "$RULE_LIGHT"
+  lines="$(count_lines "$content")"
+  echo "Checks by sudo-inbox:"
+  printf '  %s lines · sha256 %s…\n' "$lines" "$(sha256_of "$content" | cut -c 1-8)"
+  if [ "$lines" -gt "$LONG_SCRIPT_LINES" ]; then
+    printf '  ! long script (%s lines): read carefully\n' "$lines"
+  fi
+  risks="$(printf '%s' "$content" | risk_lines)"
+  if [ -n "$risks" ]; then
+    while IFS= read -r line; do printf '  ! line %s\n' "$line"; done <<<"$risks"
+  else
+    echo "  no risky patterns found"
+  fi
+  printf '%s\n' "$RULE_LIGHT"
+  while IFS= read -r line || [ -n "$line" ]; do
+    i=$((i + 1))
+    printf '%3d│%s\n' "$i" "$(printf '%s' "$line" | sanitize)"
+  done < <(printf '%s' "$content")
+  printf '%s\n' "$RULE_HEAVY"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_add() {
+  local title="" reason="" file="" have_title=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --reason) [ "$#" -ge 2 ] || die 2 "--reason needs a value"; reason="$2"; shift 2 ;;
+      -f) [ "$#" -ge 2 ] || die 2 "-f needs a file"; file="$2"; shift 2 ;;
+      -*) die 2 "unknown option for add: $1" ;;
+      *) [ "$have_title" -eq 0 ] || die 2 "add takes one title"; title="$1"; have_title=1; shift ;;
+    esac
+  done
+  [ -n "$title" ] || die 2 "add needs a title"
+
+  mkdir -p "$STATE"
+  local tmp size
+  tmp="$(mktemp "$STATE/.add.XXXXXX")"
+  if [ -n "$file" ]; then
+    [ -f "$file" ] || { rm -f "$tmp"; die 2 "no such file: $file"; }
+    cat -- "$file" >"$tmp"
+  else
+    cat >"$tmp"
+  fi
+  size="$(wc -c <"$tmp")"
+  if [ "$size" -eq 0 ]; then rm -f "$tmp"; die 5 "script is empty"; fi
+  if [ "$size" -gt "$MAX_SCRIPT_BYTES" ]; then rm -f "$tmp"; die 5 "script too large (max 256 KiB)"; fi
+  if [ "$(tr -d '\000' <"$tmp" | wc -c)" -ne "$size" ]; then
+    rm -f "$tmp"
+    die 5 "script contains NUL bytes"
+  fi
+
+  local n
+  n="$(new_entry script)"
+  mv "$tmp" "$(entry_dir "$n")/script"
+  entry_set "$n" title "$title"
+  entry_set "$n" reason "$reason"
+  log_user "added #$n $title"
+  echo "Entry #$n is waiting. Ask the user to run: sudo-inbox run $n"
+}
+
+cmd_list() {
+  local n status shown=0 others=0 title
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    status="$(entry_get "$n" status)"
+    if [ "$status" != pending ]; then
+      others=$((others + 1))
+      [ "$others" -le 10 ] || continue
+    fi
+    title="$(entry_get "$n" title | sanitize)"
+    printf '#%s  %s  %s\n' "$n" "$status" "${title:0:40}"
+    shown=1
+  done < <(entry_numbers)
+  [ "$shown" -eq 1 ] || echo "Inbox is empty."
+}
+
+cmd_show() {
+  [ "$#" -eq 1 ] || die 2 "usage: sudo-inbox show <n>"
+  require_entry "$1"
+  render_entry "$1"
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -68,6 +296,9 @@ main() {
   case "$cmd" in
     help | -h | --help) usage ;;
     version | --version) echo "sudo-inbox $VERSION" ;;
+    add) cmd_add "$@" ;;
+    list) cmd_list "$@" ;;
+    show) cmd_show "$@" ;;
     *) die 2 "unknown command: $cmd (see: sudo-inbox help)" ;;
   esac
 }
