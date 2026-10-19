@@ -192,6 +192,15 @@ set -a; . ~/work/release-bot/.env; set +a
 curl -s --header "PRIVATE-TOKEN: $GITLAB_TOKEN" https://gitlab.com/api/v4/user
 ```
 
+The same works for every personal access token or API token. Only the name and the way the
+agent sends it differ:
+
+| Service | Queue it | Use it |
+|---|---|---|
+| GitLab personal access token | `add-secret GITLAB_TOKEN --env …` | `curl --header "PRIVATE-TOKEN: $GITLAB_TOKEN" https://gitlab.com/api/v4/user` |
+| GitHub personal access token | `add-secret GITHUB_TOKEN --env …` | `curl -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/user` or `gh` reads `GITHUB_TOKEN` |
+| Jira API token | `add-secret JIRA_API_TOKEN --env …` | `curl -u "me@example.com:$JIRA_API_TOKEN" https://example.atlassian.net/rest/api/3/myself` |
+
 The token never appears in the chat, the transcript or a command line. An agent running as
 your user could still read the file, so this keeps tokens out of the conversation, not out of
 reach (see [Secrets](#secrets) for how to keep one from the agent entirely).
