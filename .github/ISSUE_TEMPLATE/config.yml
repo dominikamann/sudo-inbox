@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/dominikamann/sudo-inbox/security/advisories/new
+    about: Please report security problems privately
+  - name: Security model
+    url: https://github.com/dominikamann/sudo-inbox/blob/main/docs/security.md
+    about: What sudo-inbox protects against and what it does not

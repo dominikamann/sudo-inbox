@@ -1,0 +1,29 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tag matches VERSION in the script
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' sudo-inbox)
+          test "$TAG" = "$VER" || { echo "tag $TAG, script $VER"; exit 1; }
+      - name: Install bats and shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bats shellcheck
+      - run: shellcheck sudo-inbox test/helpers/bin/sudo
+      - run: bats test
+      - run: sha256sum sudo-inbox > sudo-inbox.sha256
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          generate_release_notes: true
+          files: |
+            sudo-inbox
+            sudo-inbox.sha256

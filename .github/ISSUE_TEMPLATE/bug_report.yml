@@ -1,0 +1,48 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. **Remove passwords, tokens and private paths
+        from everything you paste.** Security problems belong in a
+        [private advisory](https://github.com/dominikamann/sudo-inbox/security/advisories/new), not here.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Agent runs `sudo-inbox add ...`
+        2. ...
+  - type: input
+    id: version
+    attributes:
+      label: sudo-inbox version
+      description: Output of `sudo-inbox version`
+      placeholder: sudo-inbox 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      placeholder: Ubuntu 24.04, bash 5.2, sudo 1.9.15
+  - type: input
+    id: agent
+    attributes:
+      label: Agent
+      placeholder: Claude Code, Codex, OpenCode, Hermes, own scripts, ...
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The relevant terminal output, anonymized.
+      render: text
