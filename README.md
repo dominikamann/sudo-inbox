@@ -9,8 +9,9 @@
 
 **Your agent needs root. You're on the couch.**
 
-sudo-inbox is a single Bash script for servers where coding and ops agents (Claude Code, Codex,
-OpenCode, Hermes, …) do the work. When an agent needs root, it no longer pastes commands into
+Approve `sudo` for AI agents on headless Linux servers, safely, from any SSH session or your
+phone. sudo-inbox is a single Bash script for servers where coding and ops agents (Claude Code,
+Codex, OpenCode, Hermes, …) do the work. When an agent needs root, it no longer pastes commands into
 the chat for you to copy. It drops a **small script with a reason** into an inbox. You review it
 and run it with **one short command** from any SSH session, even from your phone. Your sudo
 password goes **only to sudo**. The agent reads the result itself and carries on.
@@ -41,16 +42,19 @@ output back. Passwords for services end up in the chat or twice in a `.env`.
 - `add-secret` asks you to set a secret in a `.env` file without ever seeing the value.
 
 **For you**
-- `run` shows the title and reason (marked as the agent's words), its own checks for risky
-  lines (`rm -rf`, `/etc`, `curl | sh`, `systemctl`, sudoers, SSH keys, disks …), the full script
-  with line numbers and a hash, then asks `Run it? [y/N]`.
-- Output fits a phone screen. Control characters are shown as `^[`, so nothing can hide lines.
+- `run` shows the title and reason (marked as the agent's words), the directory the script runs
+  in, its own checks for risky lines (`rm -rf`, `/etc`, `curl | sh`, `systemctl`, sudoers, SSH
+  keys, disks, files the agent could still change, hidden bidi text …), the full script with
+  line numbers and a hash, then asks `Run it? [y/N]`.
+- Output fits a phone screen. Control characters, also in the script's output, are shown as
+  `^[` or `<U+009B>`, so nothing can hide lines or repaint the screen.
 - `reject` declines with a reason the agent can read.
 - Optional notification command for Matrix, ntfy, Telegram, Pushover or anything else.
 
 **Safety**
 - What you saw is exactly what runs: the script is read once into memory and executed from there.
 - `sudo -k` before and after every run, so every approval asks for your password.
+- A dropped SSH session marks the entry `interrupted` instead of offering it again.
 - One root-owned audit log line per approval: time, entry, hash, exit code.
 - No dependencies besides bash ≥ 4, coreutils and sudo. One file you can read in one sitting.
 
@@ -103,7 +107,7 @@ output back. Passwords for services end up in the chat or twice in a `.env`.
 
 | Command | Who | What |
 |---|---|---|
-| `add <title> [--reason <text>] [-f <file>]` | agent | Queue a script (stdin or `-f`), max 256 KiB |
+| `add <title> [--reason <text>] [-f <file>]` | agent | Queue a script (stdin or `-f`), max 120 KiB, runs in the current directory |
 | `add-secret <NAME> --env <path> [options]` | agent | Ask you to set a secret in a `.env` file |
 | `wait <n> [--timeout 20m]` | agent | Block until handled (`90s`, `20m`, `1h`) |
 | `result <n>` | agent | Status, exit code and output, without waiting |
@@ -117,8 +121,9 @@ output back. Passwords for services end up in the chat or twice in a `.env`.
 
 Secret options: `--min N`, `--max N`, `--owner user:group`, `--mode 600`.
 
-`wait` and `result` exit with `0` (done, script succeeded), `1` (done, script failed),
-`3` (rejected) or `4` (timeout).
+`wait` and `result` exit with `0` (done, script succeeded), `1` (done, script failed, or
+interrupted), `3` (rejected) or `4` (timeout). An interrupted entry may have run partly and is
+never run again; check the system and queue a new entry.
 
 ### Secrets
 
@@ -130,12 +135,23 @@ sudo-inbox run 4        # shows file, key, mode and owner, then asks for the val
 ```
 
 The value is read hidden, checked for length and written atomically as `KEY=value`,
-replacing an existing key instead of adding it twice. The format works for Docker Compose and
-systemd `EnvironmentFile`. Values with spaces, `#`, `$` or `"` are single-quoted. Values with
-single quotes or newlines are refused. Only files named `.env`, `.env.*` or `*.env` are allowed,
-and symlinks are refused, so an agent cannot point a secret at `sudoers` or `authorized_keys`.
-If the file is not writable for you, the write goes through sudo with the value on stdin, never
-on the command line.
+replacing an existing key (also `export KEY=`) instead of adding it twice. The format works for
+Docker Compose and systemd `EnvironmentFile`. Values with spaces, `#`, `$` or `"` are
+single-quoted. Values with single quotes or newlines are refused. Only files named `.env`,
+`.env.*` or `*.env` are allowed, and symlinks are refused, so an agent cannot point a secret at
+`sudoers` or `authorized_keys`.
+
+Where the file lives decides who can read it afterwards:
+
+- **In a directory you can write** (your projects): sudo-inbox writes it as you, never with
+  sudo. Keep in mind that an agent running as your user can read that file too. The secret
+  stays out of the chat, not out of reach.
+- **In a root-owned directory** (for example `/etc/myapp/` or a root-owned `/opt/stack/`): the
+  write goes through sudo, with the value on stdin, never on the command line, and the file
+  keeps its owner or gets the one from `--owner`. This is how you keep a secret away from an
+  agent that runs as you.
+- **Below a directory you can write, but not writable itself**: refused, because you (or the
+  agent) could swap the directory while root writes.
 
 ### Notifications
 
@@ -174,9 +190,10 @@ exact content before it runs, returns the output to the agent and covers service
 ## Security
 
 The agent can queue work but never run it: running needs your sudo password in a real terminal.
-If the agent runs as the same Unix user as you (the usual setup), it could in principle tamper
-with your shell, so the strongest setup gives the agent its own user. Read
-[docs/security.md](docs/security.md) for the full model. Report vulnerabilities privately as
+The bytes you review are the bytes that run, but files a script reads (`./install.sh`,
+`~/nginx.conf`) can still change, which is why the review flags them. If the agent runs as the
+same Unix user as you (the usual setup today), it could in principle tamper with your shell.
+Read [docs/security.md](docs/security.md) for the full model. Report vulnerabilities privately as
 described in [SECURITY.md](SECURITY.md).
 
 ## License

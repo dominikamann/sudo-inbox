@@ -19,3 +19,5 @@ All notable changes to this project are documented here. The format follows
 - Optional notification command (`SUDO_INBOX_NOTIFY` or `~/.config/sudo-inbox/config`).
 - `hook claude-code` and `install-hook claude-code`: a `PreToolUse` hook that redirects `sudo`,
   `su`, `doas` and `pkexec` to the inbox and lets passwordless rules through.
+- Scripts run in the directory they were queued from. Entries interrupted by a hangup or Ctrl-C
+  are marked `interrupted` and never run again.
