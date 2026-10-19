@@ -176,19 +176,20 @@ Other commands exit with `0` on success, `2` for usage errors, `5` when somethin
 
 ### API tokens: the agent needs one, you never paste it into the chat
 
-This needs no root at all. Say your agent has to talk to Jira:
+This needs no root at all. Say your agent has to talk to the GitLab API (Jira, GitHub or a
+database work the same way):
 
 ```bash
 # agent
-sudo-inbox add-secret JIRA_API_TOKEN --env ~/work/jira-bot/.env --min 20
+sudo-inbox add-secret GITLAB_TOKEN --env ~/work/release-bot/.env --min 20
 sudo-inbox wait 7 --timeout 9m
 
 # you, in your own terminal: one command, then paste the token at the hidden prompt
 sudo-inbox run 7
 
 # agent: load it without ever printing it
-set -a; . ~/work/jira-bot/.env; set +a
-curl -s -u "me@example.com:$JIRA_API_TOKEN" https://example.atlassian.net/rest/api/3/myself
+set -a; . ~/work/release-bot/.env; set +a
+curl -s --header "PRIVATE-TOKEN: $GITLAB_TOKEN" https://gitlab.com/api/v4/user
 ```
 
 The token never appears in the chat, the transcript or a command line. An agent running as

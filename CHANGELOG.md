@@ -8,7 +8,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
-- README: API token example (Jira) and sponsor link; agent instructions say how to load a
+- README: API token example (GitLab) and sponsor link; agent instructions say how to load a
   secret without printing it.
 
 ## [0.1.0]
