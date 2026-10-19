@@ -234,7 +234,8 @@ render_entry() {
 }
 
 # notify <n> <title>: run the user's notification command in the
-# background. Failures are ignored and never delay the agent.
+# background with $1 = number and $2 = title. Failures are ignored and
+# never delay the agent.
 notify() {
   local cmd="${SUDO_INBOX_NOTIFY:-}" cfg line
   cfg="${XDG_CONFIG_HOME:-$HOME/.config}/sudo-inbox/config"
@@ -244,7 +245,7 @@ notify() {
     done <"$cfg"
   fi
   [ -n "$cmd" ] || return 0
-  (timeout 10 sh -c "$cmd \"\$@\"" sudo-inbox-notify "$1" "$2" </dev/null >/dev/null 2>&1 &)
+  (timeout 10 sh -c "$cmd" sudo-inbox-notify "$1" "$2" </dev/null >/dev/null 2>&1 &)
   return 0
 }
 
