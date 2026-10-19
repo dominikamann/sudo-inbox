@@ -233,6 +233,21 @@ render_entry() {
   printf '%s\n' "$RULE_HEAVY"
 }
 
+# notify <n> <title>: run the user's notification command in the
+# background. Failures are ignored and never delay the agent.
+notify() {
+  local cmd="${SUDO_INBOX_NOTIFY:-}" cfg line
+  cfg="${XDG_CONFIG_HOME:-$HOME/.config}/sudo-inbox/config"
+  if [ -z "$cmd" ] && [ -f "$cfg" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      [[ "$line" == NOTIFY=* ]] && cmd="${line#NOTIFY=}"
+    done <"$cfg"
+  fi
+  [ -n "$cmd" ] || return 0
+  (timeout 10 sh -c "$cmd \"\$@\"" sudo-inbox-notify "$1" "$2" </dev/null >/dev/null 2>&1 &)
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -272,6 +287,7 @@ cmd_add() {
   entry_set "$n" title "$title"
   entry_set "$n" reason "$reason"
   log_user "added #$n $title"
+  notify "$n" "$title"
   echo "Entry #$n is waiting. Ask the user to run: sudo-inbox run $n"
 }
 
@@ -580,6 +596,7 @@ cmd_add_secret() {
   entry_set "$n" owner "$S_OWNER"
   entry_set "$n" mode "$S_MODE"
   log_user "added #$n secret $S_NAME"
+  notify "$n" "Set $S_NAME in $S_ENV"
   echo "Entry #$n is waiting. Ask the user to run: sudo-inbox run $n"
 }
 
