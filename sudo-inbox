@@ -8,7 +8,7 @@ if [ -z "${BASH_VERSINFO[0]:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
   exit 2
 fi
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/sudo-inbox"
 ENTRIES="$STATE/entries"
 MAX_SCRIPT_BYTES=122880 # below Linux MAX_ARG_STRLEN (128 KiB)
@@ -188,6 +188,30 @@ entry_get() {
 }
 
 entry_set() { printf '%s' "$3" >"$(entry_dir "$1")/$2"; }
+
+# runner_alive <pid>: true if <pid> is a live sudo-inbox process of ours.
+runner_alive() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]] && kill -0 "$1" 2>/dev/null || return 1
+  [ -r "/proc/$1/cmdline" ] || return 0
+  local cmd
+  cmd="$(tr '\0' ' ' <"/proc/$1/cmdline")" || return 0
+  [[ "$cmd" == *sudo-inbox* ]]
+}
+
+# entry_status <n>: the status, with a "running" entry whose runner is
+# gone (reboot, kill -9, or a version that did not record it) turned
+# into "interrupted" for good.
+entry_status() {
+  local status
+  status="$(entry_get "$1" status)"
+  if [ "$status" = running ] && ! runner_alive "$(entry_get "$1" runner)"; then
+    status=interrupted
+    entry_set "$1" status "$status"
+    entry_set "$1" finished "$(now_utc)"
+    log_user "interrupted #$1 (runner gone)"
+  fi
+  printf '%s' "$status"
+}
 
 require_entry() {
   [[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || die 2 "not an entry number: ${1:-}"
@@ -369,7 +393,7 @@ cmd_list() {
   local n status shown=0 others=0 title
   while IFS= read -r n; do
     [ -n "$n" ] || continue
-    status="$(entry_get "$n" status)"
+    status="$(entry_status "$n")"
     if [ "$status" != pending ]; then
       others=$((others + 1))
       [ "$others" -le 10 ] || continue
@@ -439,8 +463,11 @@ root_exec() {
   RUN_TMP="$(mktemp "$STATE/.run.XXXXXX")"
   sudo -k 2>/dev/null || true
   set +e
+  # stdin is /dev/null: sudo still asks on /dev/tty, but the script never
+  # touches the terminal. apt-get resets it at the end and got stopped
+  # by SIGTTOU because the piped run is not in the foreground.
   sudo -k -- bash -c "$ROOT_WRAPPER" sudo-inbox "$ROOT_LOG" "$(id -un)" "$n" "$type" "$sha" \
-    "$(printf '%s' "$title" | sanitize line)" "$payload" "$cwd" 2>&1 \
+    "$(printf '%s' "$title" | sanitize line)" "$payload" "$cwd" </dev/null 2>&1 \
     | tee "$RUN_TMP" | show_live
   rc="${PIPESTATUS[0]}"
   set -e
@@ -483,10 +510,11 @@ cmd_run() {
     fi
   fi
   require_entry "$n"
-  status="$(entry_get "$n" status)"
-  if [ "$status" = interrupted ] || [ "$status" = running ]; then
-    die 5 "entry #$n is $status: it may have run partly.
-Check the system, then reject it or queue it again."
+  status="$(entry_status "$n")"
+  [ "$status" != running ] || die 5 "entry #$n is running right now"
+  if [ "$status" = interrupted ]; then
+    die 5 "entry #$n is interrupted: it may have run partly.
+Check the system, then close it with: sudo-inbox reject $n [<reason>]"
   fi
   [ "$status" = pending ] || die 5 "entry #$n is $(printf '%s' "$status" | sanitize line)"
   if [ "$(entry_get "$n" type)" = secret ]; then
@@ -506,6 +534,7 @@ Check the system, then reject it or queue it again."
 
   RUN_ENTRY="$n"
   trap on_interrupt HUP INT TERM
+  entry_set "$n" runner "$$"
   entry_set "$n" status running
   root_exec "$n" script "$sha" "$title" "$content" "${cwd:-/}" || rc=$?
   trap - HUP INT TERM
@@ -527,8 +556,8 @@ cmd_reject() {
   if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then die 2 "usage: sudo-inbox reject <n> [<reason>]"; fi
   require_entry "$1"
   local status
-  status="$(entry_get "$1" status)"
-  [ "$status" = pending ] || die 5 "entry #$1 is $(printf '%s' "$status" | sanitize line)"
+  status="$(entry_status "$1")"
+  [[ "$status" =~ ^(pending|interrupted)$ ]] || die 5 "entry #$1 is $(printf '%s' "$status" | sanitize line)"
   entry_set "$1" reject_reason "${2:-}"
   entry_set "$1" finished "$(now_utc)"
   entry_set "$1" status rejected
@@ -539,7 +568,7 @@ cmd_reject() {
 # print_result <n>: status block for agents. Exit code per status.
 print_result() {
   local n="$1" status code
-  status="$(entry_get "$n" status)"
+  status="$(entry_status "$n")"
   case "$status" in
     pending | running)
       echo "status: $status"
@@ -594,7 +623,7 @@ cmd_wait() {
   require_entry "$n"
   secs="$(parse_duration "$timeout")" || die 2 "bad timeout: $timeout (use e.g. 90s, 20m, 1h)"
   deadline=$((SECONDS + secs))
-  while [[ "$(entry_get "$n" status)" =~ ^(pending|running)$ ]]; do
+  while [[ "$(entry_status "$n")" =~ ^(pending|running)$ ]]; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       echo "status: pending (timed out after $timeout)"
       return 4

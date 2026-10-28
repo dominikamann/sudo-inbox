@@ -176,3 +176,56 @@ EOS
   [ "$status" -eq 5 ]
   [[ "$output" != *$'\033'* ]]
 }
+
+@test "script gets no terminal on stdin" {
+  printf '%s\n' 'IFS= read -r x; echo "got:$x"; [ -t 0 ] && echo tty || echo notty' | "$SI" add T
+  run bash -c "printf 'y\nleak\n' | '$SI' run 1"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$ENTRIES/1/output")" = $'got:\nnotty' ]
+}
+
+@test "running entry whose runner is gone counts as interrupted" {
+  echo true | "$SI" add T
+  echo running >"$ENTRIES/1/status"
+  bash -c 'exit 0' &
+  dead=$!
+  wait "$dead"
+  echo "$dead" >"$ENTRIES/1/runner"
+  run "$SI" result 1
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"status: interrupted"* ]]
+  [ "$(cat "$ENTRIES/1/status")" = interrupted ]
+  grep -q 'interrupted #1 (runner gone)' "$XDG_STATE_HOME/sudo-inbox/log"
+}
+
+@test "running entry from an older version without runner counts as interrupted" {
+  echo true | "$SI" add T
+  echo running >"$ENTRIES/1/status"
+  run "$SI" list
+  [[ "$output" == *"#1  interrupted  T"* ]]
+}
+
+@test "running entry with a live runner stays running" {
+  echo 'sleep 30' | "$SI" add T
+  setsid bash -c "echo y | '$SI' run 1 >/dev/null 2>&1" &
+  pid=$!
+  for _ in $(seq 50); do [ "$(cat "$ENTRIES/1/status")" = running ] && break; sleep 0.1; done
+  [ -s "$ENTRIES/1/runner" ]
+  run "$SI" result 1
+  [ "$output" = "status: running" ]
+  run "$SI" reject 1
+  [ "$status" -eq 5 ]
+  [ "$(cat "$ENTRIES/1/status")" = running ]
+  kill -HUP -- "-$pid"
+  wait "$pid" 2>/dev/null || true
+}
+
+@test "reject closes an interrupted entry" {
+  echo true | "$SI" add T
+  echo interrupted >"$ENTRIES/1/status"
+  run "$SI" reject 1 "checked, queue a new one"
+  [ "$status" -eq 0 ]
+  run "$SI" result 1
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"reason: checked, queue a new one"* ]]
+}
