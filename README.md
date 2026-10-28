@@ -89,7 +89,7 @@ output back. Passwords for services end up in the chat or twice in a `.env`.
 
 1. Download, **read**, install root-owned:
    ```bash
-   curl -fsSLO https://raw.githubusercontent.com/dominikamann/sudo-inbox/v0.1.0/sudo-inbox
+   curl -fsSLO https://raw.githubusercontent.com/dominikamann/sudo-inbox/v0.2.0/sudo-inbox
    less sudo-inbox
    sudo install -m 755 -o root -g root sudo-inbox /usr/local/bin/
    ```
@@ -159,7 +159,7 @@ answered yet. The agent then simply calls `wait` again. The hook and the instruc
 | `list` | you | Waiting and recent entries |
 | `show <n>` | you | Entry in full |
 | `run [<n>]` | you | Review and run (default: oldest waiting) |
-| `reject <n> [<reason>]` | you | Decline |
+| `reject <n> [<reason>]` | you | Decline a waiting entry, or close an interrupted one |
 | `secret <NAME> --env <path> [options]` | you | Set a secret directly |
 | `install-hook claude-code\|codex` | you | Install the hook for Claude Code or Codex |
 | `hook claude-code\|codex` | the agent | The `PreToolUse` hook itself |
@@ -168,7 +168,12 @@ Secret options: `--min N`, `--max N`, `--owner user:group`, `--mode 600`.
 
 `wait` and `result` exit with `0` (done, script succeeded), `1` (done, script failed, or
 interrupted), `3` (rejected) or `4` (timeout). An interrupted entry may have run partly and is
-never run again; check the system and queue a new entry.
+never run again; check the system, close it with `reject <n> [<reason>]` and queue a new entry.
+If `run` was killed hard (reboot, `kill -9`), the entry no longer stays on `running`: the next
+`list`, `wait` or `result` sees the runner is gone and marks it `interrupted`.
+
+Scripts run without input: stdin is `/dev/null`, so nothing can wait for a keypress or grab your
+terminal. Use non-interactive flags such as `apt-get -y`.
 
 Other commands exit with `0` on success, `2` for usage errors, `5` when something is refused
 (missing entry, wrong state, path or validation rules) and `6` when sudo did not run anything

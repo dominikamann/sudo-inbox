@@ -9,9 +9,9 @@ load helpers/common
   done
 }
 
-@test "version prints 0.1.0" {
+@test "version prints 0.2.0" {
   run "$SI" version
-  [ "$output" = "sudo-inbox 0.1.0" ]
+  [ "$output" = "sudo-inbox 0.2.0" ]
 }
 
 @test "unknown command exits 2" {

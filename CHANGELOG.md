@@ -6,10 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-28
+
 ### Changed
 
 - README: API token examples (GitLab, GitHub, Jira personal access tokens) and sponsor link; agent instructions say how to load a
   secret without printing it.
+
+### Fixed
+
+- `run`: scripts get `/dev/null` as stdin. `apt-get upgrade` used to hang stopped at the end
+  (SIGTTOU when it reset the terminal), the entry stayed on `running` and the terminal took no
+  more input.
+- An entry no longer stays on `running` forever when `run` was killed hard (reboot, `kill -9`, a
+  terminal that hung). `run` records its process, and `list`, `wait`, `result`, `run` and
+  `reject` mark the entry `interrupted` once that process is gone. Older entries without that
+  record count as interrupted too.
+- `reject` now closes interrupted entries, as the message from `run` already said.
 
 ## [0.1.0]
 
